@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+
+COLONY_MAIN_KEY="COLONY_MAIN_PANE"
+COLONY_PEER_PREFIX="COLONY_PEER_"
+COLONY_LOG_FILE="${COLONY_LOG_FILE:-$HOME/.colony/colony.log}"
+
+log_event() {
+  mkdir -p "$(dirname "$COLONY_LOG_FILE")"
+  local ts
+  ts=$(date '+%Y-%m-%dT%H:%M:%S%z')
+  echo "[$ts] $*" >> "$COLONY_LOG_FILE"
+}
+
+usage() {
+  cat <<EOF
+colony — tmux workspace manager for multi-agent sessions
+
+Usage:
+  colony register <name> [pane-id]   Register a pane with a name (auto-detects current pane if omitted)
+  colony send <message> <name-or-id> Send message to a named pane
+  colony split                        Split current pane (smart: vertical for main, horizontal for others)
+  colony spawn <command> [name]       Split + run a command; auto-register new pane if name given
+  colony close <name-or-id>          Kill a pane and unregister it
+  colony list                         List all registered panes
+  colony help                         Show this help
+
+Examples:
+  colony register test1 %16
+  colony register test2 %0
+  colony send "hello" test2
+  colony split
+  colony spawn claude
+  colony spawn opencode
+  colony spawn kiro-cli
+EOF
+}
+
+current_pane() {
+  # $TMUX_PANE is set per-pane at shell spawn and is immune to window focus;
+  # 'tmux display-message -p' with no -t falls back to the session's ACTIVE
+  # pane when the caller isn't itself an attached client (colony's case),
+  # which misattributes sends from any non-focused pane sharing a window.
+  echo "${TMUX_PANE:-$(tmux display-message -p '#{pane_id}')}"
+}
+
+resolve_pane() {
+  local target="$1"
+  if [[ "$target" == %* ]]; then
+    echo "$target"
+    return
+  fi
+  local key="${COLONY_PEER_PREFIX}${target^^}"
+  local pane_id
+  pane_id=$(tmux show-environment -g "$key" 2>/dev/null | cut -d= -f2)
+  if [[ -z "$pane_id" ]]; then
+    echo "Error: no pane registered with name '$target'. Run: colony register $target <pane-id>" >&2
+    exit 1
+  fi
+  echo "$pane_id"
+}
+
+is_main_pane() {
+  local current
+  current=$(current_pane)
+  local main
+  main=$(tmux show-environment -g "$COLONY_MAIN_KEY" 2>/dev/null | cut -d= -f2)
+  [[ "$current" == "$main" ]]
+}
+
+do_register() {
+  if [[ $# -lt 1 ]]; then
+    echo "Error: register requires <name>" >&2
+    exit 1
+  fi
+  local name="$1" pane_id="${2:-$(current_pane)}"
+  local key="${COLONY_PEER_PREFIX}${name^^}"
+  local prev_id
+  prev_id=$(tmux show-environment -g "$key" 2>/dev/null | cut -d= -f2)
+  # Remove any other names already pointing at this pane_id so a pane never
+  # has more than one live name mapping (avoids ambiguous reverse lookups).
+  tmux show-environment -g | grep "^${COLONY_PEER_PREFIX}" | while IFS= read -r line; do
+    local existing_key="${line%%=*}"
+    local existing_id="${line#*=}"
+    if [[ "$existing_id" == "$pane_id" && "$existing_key" != "$key" ]]; then
+      log_event "REGISTER by=$(current_pane) unset ${existing_key#${COLONY_PEER_PREFIX}} (was $existing_id, reassigned to $name)"
+      tmux set-environment -g -u "$existing_key" 2>/dev/null || true
+    fi
+  done
+  tmux set-environment -g "$key" "$pane_id"
+  log_event "REGISTER by=$(current_pane) name=$name pane=$pane_id prev=${prev_id:-none}"
+  # First registered pane becomes the main pane
+  if ! tmux show-environment -g "$COLONY_MAIN_KEY" &>/dev/null; then
+    tmux set-environment -g "$COLONY_MAIN_KEY" "$pane_id"
+    echo "Registered: $name → $pane_id (main pane)"
+  else
+    echo "Registered: $name → $pane_id"
+  fi
+}
+
+wait_for_pane() {
+  local pane="$1"
+  local timeout=30
+  local elapsed=0
+  # Wait until pane is no longer running a shell (zsh/bash/sh)
+  while [[ $elapsed -lt $timeout ]]; do
+    local cmd
+    cmd=$(tmux display-message -t "$pane" -p "#{pane_current_command}" 2>/dev/null)
+    if [[ "$cmd" != "zsh" && "$cmd" != "bash" && "$cmd" != "sh" && -n "$cmd" ]]; then
+      sleep 1  # extra delay for TUI to render
+      return 0
+    fi
+    sleep 0.5
+    elapsed=$((elapsed + 1))
+  done
+  echo "Warning: pane $pane still at shell after ${timeout}s, sending anyway" >&2
+}
+
+do_send() {
+  if [[ $# -lt 2 ]]; then
+    echo "Error: send requires <message> and <pane name or ID>" >&2
+    exit 1
+  fi
+  local message="$1"
+  local my_pane my_name
+  my_pane=$(current_pane)
+  local my_matches
+  my_matches=$(tmux show-environment -g | grep "^COLONY_PEER_" | while IFS= read -r line; do
+    id="${line#*=}"
+    [[ "$id" == "$my_pane" ]] && echo "${line%%=*}" | sed 's/^COLONY_PEER_//' | tr '[:upper:]' '[:lower:]'
+  done)
+  my_name=$(echo "$my_matches" | head -n1)
+  if [[ "$(echo "$my_matches" | wc -l)" -gt 1 ]]; then
+    echo "Warning: pane $my_pane has multiple registered names ($(echo "$my_matches" | tr '\n' ' ')); using '$my_name'. Re-run 'colony register <name> $my_pane' to fix." >&2
+  fi
+  if [[ -n "$my_name" ]]; then
+    message="[COLONY MSG]"$'\n'"From        : ${my_name}"$'\n'"Message     : ${message}"$'\n'"Instruction : Reply to ${my_name} via colony only if you have useful information to share. No reply needed otherwise."$'\n'"[/COLONY MSG]"
+  fi
+  local pane
+  pane=$(resolve_pane "$2")
+  log_event "SEND from_pane=${my_pane} from_name=${my_name:-<unregistered>} to=$2 to_pane=${pane} msg_preview=$(echo "$1" | head -c 120 | tr '\n' ' ')"
+  local pane_content
+  pane_content=$(tmux capture-pane -t "$pane" -p 2>/dev/null)
+  if echo "$pane_content" | grep -q "OpenCode\|ctrl+p commands\|tab agents"; then
+    tmux set-buffer "$message"
+    tmux paste-buffer -p -t "$pane"
+    sleep 0.3
+    tmux send-keys -t "$pane" Enter
+  else
+    tmux send-keys -l -t "$pane" "$message"
+    sleep 0.3
+    tmux send-keys -t "$pane" Enter
+  fi
+}
+
+do_split() {
+  local cmd="$1"
+  local register_name="$2"
+  local current
+  current=$(current_pane)
+  local main
+  main=$(tmux show-environment -g "$COLONY_MAIN_KEY" 2>/dev/null | cut -d= -f2)
+
+  # Wrap command so pane survives if the process exits
+  local wrapped_cmd=""
+  [[ -n "$cmd" ]] && wrapped_cmd="zsh -c '${cmd}; exec zsh'"
+
+  local new_pane
+  if [[ "$current" == "$main" ]]; then
+    if [[ -n "$wrapped_cmd" ]]; then
+      new_pane=$(tmux split-window -h -d -P -F "#{pane_id}" -t "$current" "$wrapped_cmd")
+    else
+      new_pane=$(tmux split-window -h -d -P -F "#{pane_id}" -t "$current")
+    fi
+  else
+    if [[ -n "$wrapped_cmd" ]]; then
+      new_pane=$(tmux split-window -v -d -P -F "#{pane_id}" -t "$current" "$wrapped_cmd")
+    else
+      new_pane=$(tmux split-window -v -d -P -F "#{pane_id}" -t "$current")
+    fi
+  fi
+
+  if [[ -n "$register_name" ]]; then
+    do_register "$register_name" "$new_pane"
+    # Auto-send identity context once the pane is ready
+    local main_name
+    main_name=$(tmux show-environment -g | grep "^${COLONY_PEER_PREFIX}" | while IFS= read -r line; do
+      local n="${line#${COLONY_PEER_PREFIX}}"; n="${n%%=*}"; id="${line#*=}"
+      local m; m=$(tmux show-environment -g "$COLONY_MAIN_KEY" 2>/dev/null | cut -d= -f2)
+      [[ "$id" == "$m" ]] && echo "${n,,}" && break
+    done)
+    [[ -z "$main_name" ]] && main_name="test1"
+    (
+      wait_for_pane "$new_pane"
+      tmux send-keys -t "$new_pane" "You are colony agent '${register_name}' (pane ${new_pane}). The orchestrator is '${main_name}'. Reply to messages using: colony send \"your reply\" ${main_name}"
+      sleep 0.3
+      tmux send-keys -t "$new_pane" Enter
+    ) &
+  else
+    echo "$new_pane"
+  fi
+}
+
+do_close() {
+  if [[ -z "$1" ]]; then
+    echo "Error: close requires <name or pane-id>" >&2
+    exit 1
+  fi
+  local pane
+  pane=$(resolve_pane "$1")
+  tmux kill-pane -t "$pane"
+  echo "Closed: $1 ($pane)"
+  # Unset every registered name pointing at this pane_id, not just the
+  # literal argument passed in (which may itself be a pane ID, e.g. %16).
+  tmux show-environment -g | grep "^${COLONY_PEER_PREFIX}" | while IFS= read -r line; do
+    local existing_key="${line%%=*}"
+    local existing_id="${line#*=}"
+    [[ "$existing_id" == "$pane" ]] && tmux set-environment -g -u "$existing_key" 2>/dev/null || true
+  done
+}
+
+do_list() {
+  local main
+  main=$(tmux show-environment -g "$COLONY_MAIN_KEY" 2>/dev/null | cut -d= -f2)
+  echo "Registered panes:"
+  tmux show-environment -g | grep "^${COLONY_PEER_PREFIX}" | while IFS= read -r line; do
+    local name id tag
+    name="${line#${COLONY_PEER_PREFIX}}"
+    name="${name%%=*}"
+    id="${line#*=}"
+    tag=""
+    [[ "$id" == "$main" ]] && tag=" (main)"
+    printf "  %-20s %s%s\n" "${name,,}" "$id" "$tag"
+  done
+}
+
+case "$1" in
+  help|--help|-h|"")
+    usage
+    exit 0
+    ;;
+  register)
+    shift; do_register "$@"
+    ;;
+  send)
+    shift; do_send "$@"
+    ;;
+  split)
+    do_split
+    ;;
+  spawn)
+    if [[ -z "$2" ]]; then
+      echo "Error: spawn requires a command (e.g. colony spawn claude)" >&2
+      exit 1
+    fi
+    do_split "$2" "$3"
+    ;;
+  close)
+    shift; do_close "$@"
+    ;;
+  list)
+    do_list
+    ;;
+  *)
+    echo "Error: unknown command '$1'" >&2
+    echo "Run 'colony help' for usage." >&2
+    exit 1
+    ;;
+esac

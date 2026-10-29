@@ -1,0 +1,10 @@
+target/
+result
+.superpowers/
+
+# Private planning notes and local logs (kept on disk only)
+plan/BRAINSTORM.md
+plan/DESIGN.md
+plan/PRD.md
+plan/TASK.md
+test.log

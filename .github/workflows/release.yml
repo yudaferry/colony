@@ -1,0 +1,96 @@
+name: release
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies (musl, cmake, perl for aws-lc-sys)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends musl-tools cmake perl
+
+      - name: Toolchain (version from rust-toolchain.toml) and musl target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$TARGET"
+          rustc --version
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build static release binary
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target "$TARGET"
+
+      - name: Check binary is static
+        run: |
+          file "target/$TARGET/release/colony"
+          ! ldd "target/$TARGET/release/colony" 2>/dev/null | grep -q 'libc.so'
+          "target/$TARGET/release/colony" --help
+
+      - name: Version and tag check
+        id: ver
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name=="colony") | .version')
+          tag="v${version}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" >/dev/null 2>&1; then
+            echo "Tag ${tag} exists: build and test only."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Tag ${tag} is new: will release."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Release
+        if: steps.ver.outputs.release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          TAG: ${{ steps.ver.outputs.tag }}
+        run: |
+          set -euo pipefail
+          name="colony-${VERSION}-x86_64-linux"
+          mkdir -p dist
+          cp "target/${TARGET}/release/colony" dist/colony
+          chmod 755 dist/colony
+          tar czf "dist/${name}.tar.gz" -C dist colony
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+          awk -v h="## colony ${VERSION}" '
+            index($0, h) == 1 { on = 1; next }
+            on && /^## / { exit }
+            on { print }
+          ' RELEASE_NOTES.md > notes.md
+          if ! grep -q '[^[:space:]]' notes.md; then
+            echo "No '## colony ${VERSION}' section in RELEASE_NOTES.md" >&2
+            exit 1
+          fi
+
+          gh release create "$TAG" \
+            "dist/${name}.tar.gz" "dist/${name}.tar.gz.sha256" \
+            --target "$GITHUB_SHA" \
+            --title "colony ${VERSION}" \
+            --notes-file notes.md
