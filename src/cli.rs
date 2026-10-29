@@ -101,10 +101,13 @@ pub enum Cmd {
 
 #[derive(Subcommand, Debug)]
 pub enum TgCmd {
-    /// Validate and save a bot token, then start the bot pane
+    /// Validate and save a bot token, then run the bot here until Ctrl+C
     Connect {
         /// Bot API token
         token: String,
+        /// Run the bot in a new `telegram-bot` pane instead of this one
+        #[arg(long)]
+        new_pane: bool,
     },
     /// Stop the bot and delete the token and lock
     Disconnect,
@@ -274,6 +277,18 @@ mod tests {
         assert!(Cli::try_parse_from(["colony", "telegram", "receiver"]).is_err());
         assert!(Cli::try_parse_from(["colony", "telegram", "receiver", "bo"]).is_ok());
         assert!(Cli::try_parse_from(["colony", "telegram", "receiver", "--clear"]).is_ok());
+    }
+
+    #[test]
+    fn telegram_connect_new_pane_flag() {
+        match parse(&["colony", "telegram", "connect", "1:x"]).cmd.unwrap() {
+            Cmd::Telegram { cmd: TgCmd::Connect { new_pane, .. } } => assert!(!new_pane),
+            other => panic!("{other:?}"),
+        }
+        match parse(&["colony", "telegram", "connect", "1:x", "--new-pane"]).cmd.unwrap() {
+            Cmd::Telegram { cmd: TgCmd::Connect { new_pane, .. } } => assert!(new_pane),
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]

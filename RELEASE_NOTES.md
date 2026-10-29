@@ -1,5 +1,27 @@
 # Release Notes
 
+## colony 1.1.0 — 2026-10-30 (WIB, UTC+7)
+
+### Changed
+
+- **`colony telegram connect <token>` runs the bot in the current pane** until Ctrl+C, instead of opening a new pane. Use `--new-pane` for the old behaviour (a separate `telegram-bot` pane), e.g. when a Claude session runs `connect` and must not block its own pane.
+- **`colony telegram status` checks the bot process**, not just its pane: the last line shows `bot process: running (pid N)` or `not running`. A crashed bot is no longer reported as running.
+- **`colony telegram disconnect`** stops the bot and closes a pane only if colony opened it with `--new-pane`.
+- `connect` does not start a second bot when one is already running; a running bot picks up a new token by itself.
+
+### New
+
+- **Claude Code skill** in `skills/colony/SKILL.md`: teaches Claude sessions to use colony (spawning, messaging, replying to `[COLONY MSG]` blocks and Telegram). Install with `cp -r skills/colony ~/.claude/skills/`.
+
+### Download
+
+Download `colony-1.1.0-x86_64-linux.tar.gz` (static Linux x86_64 build, with a `.sha256` file), then:
+
+```bash
+tar xzf colony-1.1.0-x86_64-linux.tar.gz
+./colony --help
+```
+
 ## colony 1.0.0 — 2026-10-30 (WIB, UTC+7)
 
 First release of colony 2: a Rust rewrite of the Bash `colony` script (kept in `old-colony/`).

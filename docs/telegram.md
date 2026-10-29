@@ -8,9 +8,13 @@ The bot lets one person list sessions, message them and read their output from a
 
 1. Calls the Bot API `getMe` to check the token.
 2. Saves the token and the connect time in `~/.colony/telegram.json` (mode 600). If the token belongs to the same bot as before, the user lock is kept; for a different bot the lock and the polling offset are reset.
-3. Opens a pane named `telegram-bot` next to the current one and runs `colony telegram run` in it. If the bot pane is already alive, it does nothing more. Outside herdr and tmux, it prints the command to run yourself.
+3. Runs the bot loop **in the current pane**, in the foreground (same as `colony telegram run`), until Ctrl+C or until `disconnect` clears the token. It prints `Connected as @bot - bot running here, Ctrl+C to stop` first. It opens no pane and registers no name, and it works without herdr or tmux.
 
-`colony telegram disconnect` closes the bot pane and clears the token, lock, receiver and all pending reply IDs. The bot loop exits when the token is gone. `colony telegram status` shows whether it is connected, the bot name, the locked user id, the receiver and whether the bot pane is alive.
+`colony telegram connect <token> --new-pane` is for a Claude session that must not block its own pane: it opens a pane named `telegram-bot` next to the current one and runs `colony telegram run` in it. Outside herdr and tmux it prints the command to run yourself.
+
+The running loop records its PID and start time in `telegram.json` and clears them on a clean exit. `connect` refuses to start a second bot when a live bot process for the same token exists, and says where it runs. If the token is new while a bot is alive, that bot switches to the new token and no second one is started.
+
+`colony telegram disconnect` clears the token, lock, receiver and all pending reply IDs; the bot loop exits when the token is gone. It closes the `telegram-bot` pane only if colony created it with `--new-pane`, never a pane it did not create. `colony telegram status` shows whether it is connected, the bot name, the locked user id, the receiver and `bot process: running (pid N[, pane P])`. The process counts as running only if its PID is alive and (where `/proc` exists) its command line is a colony process; otherwise `not running`.
 
 ## Polling
 
@@ -65,5 +69,5 @@ Only messages that carry a reply ID are ever sent to Telegram, and nothing is se
 - `telegram.json` and `pending.json` are mode 600 (they hold the token and chat ids); `~/.colony` is mode 700.
 - The bot token is visible in `ps` and shell history while `colony telegram connect` runs.
 - A session that knows a valid reply ID can post to the chat; IDs are random, short-lived and only sent to the session that should answer.
-- A crashed bot still counts as running while its pane stays open.
+- A crashed bot is shown as `not running` once its PID is gone; a stale PID that was reused by a non-colony process is ignored.
 - Treat the locked chat like a remote control for your sessions: anything you can `/send` is typed into a Claude session, which may run commands.

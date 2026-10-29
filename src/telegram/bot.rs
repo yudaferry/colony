@@ -327,6 +327,28 @@ pub fn run_once_for(ctx: &Ctx, api: &dyn TelegramApi, bot: Option<i64>, offset: 
     Ok(())
 }
 
+/// Records (or clears) this process as the running bot in telegram.json. Clearing
+/// only touches the record if it is still ours.
+fn set_bot_pid(ctx: &Ctx, on: bool) {
+    let me = std::process::id();
+    let now = ctx.clock.now().timestamp();
+    let r = ctx
+        .state
+        .update_json(TELEGRAM_FILE, TELEGRAM_MODE, |c: &mut TelegramConfig| {
+            if on {
+                c.bot_pid = Some(me);
+                c.bot_started_at = Some(now);
+            } else if c.bot_pid == Some(me) {
+                c.bot_pid = None;
+                c.bot_started_at = None;
+            }
+            Ok(())
+        });
+    if let Err(e) = r {
+        warn(ctx, &format!("{e:#}"));
+    }
+}
+
 /// Loops `run_once` until the token is cleared (disconnect). The API is rebuilt
 /// from the saved token on every pass, so a reconnect with a new token is picked up.
 pub fn run_loop(
@@ -336,6 +358,7 @@ pub fn run_loop(
     sleep: &dyn Fn(Duration),
 ) {
     let mut current_bot: Option<i64> = None;
+    let mut registered = false;
     loop {
         let cfg: TelegramConfig = match ctx.state.read_json(TELEGRAM_FILE) {
             Ok(c) => c,
@@ -346,8 +369,15 @@ pub fn run_loop(
             }
         };
         let Some(token) = cfg.token.clone() else {
+            if registered {
+                set_bot_pid(ctx, false);
+            }
             return;
         };
+        if !registered {
+            registered = true;
+            set_bot_pid(ctx, true);
+        }
         if let Err(e) = sync_offset(ctx, &cfg, &token, offset, &mut current_bot) {
             warn(ctx, &format!("{e:#}"));
             sleep(RETRY_SLEEP);
@@ -691,6 +721,35 @@ mod tests {
         let mut offset = 0;
         run_loop(&h.ctx(), &f, &mut offset, &|_| {});
         assert!(!polled.get());
+    }
+
+    #[test]
+    fn run_loop_records_pid_then_clears_it_on_exit() {
+        let h = Harness::herdr();
+        locked(&h);
+        let seen = std::cell::Cell::new(None);
+        let state = &h.state;
+        let f = |_t: &str| -> Box<dyn TelegramApi> {
+            let c: TelegramConfig = state.read_json(TELEGRAM_FILE).unwrap();
+            seen.set(Some((c.bot_pid, c.bot_started_at)));
+            state
+                .update_json(TELEGRAM_FILE, TELEGRAM_MODE, |c: &mut TelegramConfig| {
+                    c.token = None;
+                    Ok(())
+                })
+                .unwrap();
+            Box::new(FakeTelegram::new())
+        };
+        let mut offset = 0;
+        run_loop(&h.ctx(), &f, &mut offset, &|_| {});
+        let (pid, started) = seen.get().unwrap();
+        assert_eq!(pid, Some(std::process::id()));
+        assert_eq!(started, Some(h.ctx().clock.now().timestamp()));
+        let c: TelegramConfig = h.state.read_json(TELEGRAM_FILE).unwrap();
+        assert_eq!((c.bot_pid, c.bot_started_at), (None, None));
+        let mode = std::fs::metadata(h.state.path(TELEGRAM_FILE)).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(mode.permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

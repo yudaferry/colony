@@ -1,4 +1,4 @@
-//! `telegram.json` (mode 600): token, lock, receiver.
+//! `telegram.json` (mode 600): token, lock, receiver, bot process.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,6 +21,39 @@ pub struct TelegramConfig {
     /// The bot `offset` belongs to; a different bot id resets the offset.
     #[serde(default)]
     pub offset_bot_id: Option<i64>,
+    /// PID of the running bot loop, recorded by the loop itself and cleared on clean exit.
+    #[serde(default)]
+    pub bot_pid: Option<u32>,
+    /// Unix time the bot loop started.
+    #[serde(default)]
+    pub bot_started_at: Option<i64>,
+    /// Pane colony created for the bot (`connect --new-pane`); only this pane is closed by `disconnect`.
+    #[serde(default)]
+    pub bot_pane: Option<String>,
+}
+
+impl TelegramConfig {
+    /// The recorded bot PID, only if that process is alive and looks like colony.
+    pub fn live_bot_pid(&self) -> Option<u32> {
+        self.bot_pid.filter(|p| pid_alive(*p))
+    }
+}
+
+/// True when `pid` is a live colony process. With `/proc` the command line must
+/// mention colony (guards against PID reuse); without it, `kill -0` decides.
+pub fn pid_alive(pid: u32) -> bool {
+    if std::path::Path::new("/proc/self").exists() {
+        return match std::fs::read(format!("/proc/{pid}/cmdline")) {
+            Ok(b) => String::from_utf8_lossy(&b).contains("colony"),
+            Err(_) => false,
+        };
+    }
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]

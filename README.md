@@ -36,6 +36,14 @@ nix develop          # shell with Rust 1.99.1, then: cargo build --release
 
 Without Nix, use Rust 1.99.1 (see `rust-toolchain.toml`) and run `cargo build --release`.
 
+### Claude Code skill
+
+`skills/colony/SKILL.md` teaches Claude Code sessions how to use colony (spawning, messaging, replying to `[COLONY MSG]` blocks and Telegram). Install it for your user:
+
+```bash
+mkdir -p ~/.claude/skills && cp -r skills/colony ~/.claude/skills/
+```
+
 ## Requirements
 
 - herdr (tested with 0.9.5) and/or tmux
@@ -69,8 +77,8 @@ colony close api                                       # close it
 | `colony read <name\|id> [--lines N]` | Print recent output |
 | `colony wait <name\|id> --until idle\|blocked [--timeout SEC]` | Wait for an agent state (herdr only) |
 | `colony close <name\|id>` | Close the pane and drop its name |
-| `colony telegram connect <token>` | Check and save the bot token, start the bot in a `telegram-bot` pane |
-| `colony telegram status` / `disconnect` | Show / stop the bot |
+| `colony telegram connect <token> [--new-pane]` | Check and save the bot token, run the bot here until Ctrl+C (`--new-pane`: in a `telegram-bot` pane) |
+| `colony telegram status` / `disconnect` | Show (incl. running pid) / stop the bot |
 | `colony telegram receiver <name>` / `--clear` | Set / clear the session that gets plain-text messages |
 | `colony telegram reply <id> "<text>"` | Send an answer straight to the Telegram chat |
 
@@ -79,7 +87,7 @@ colony close api                                       # close it
 ## Telegram
 
 1. Create a bot with [@BotFather](https://t.me/BotFather) (`/newbot`) and copy the token.
-2. Run `colony telegram connect <token>` inside herdr or tmux.
+2. Run `colony telegram connect <token>`. The bot runs in that pane until Ctrl+C (add `--new-pane` inside herdr or tmux to run it in its own `telegram-bot` pane, e.g. from a Claude session).
 3. Send any message to your bot. The first person to message it after `connect` is locked in as its only user.
 
 From your phone:

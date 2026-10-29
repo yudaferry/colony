@@ -100,9 +100,14 @@ fn saved_token(ctx: &Ctx) -> Result<String> {
 
 fn telegram(ctx: &Ctx, cmd: TgCmd) -> Result<String> {
     match cmd {
-        TgCmd::Connect { token } => {
+        TgCmd::Connect { token, new_pane } => {
             let exe = std::env::current_exe()?;
-            cmds::connect(ctx, &http_api, &token, &exe)
+            let done = cmds::connect(ctx, &http_api, &token, &exe, new_pane)?;
+            if done.run_here {
+                println!("{}", done.message);
+                bot::run(ctx, &http_api)
+            }
+            Ok(done.message)
         }
         TgCmd::Disconnect => cmds::disconnect(ctx),
         TgCmd::Status => cmds::status(ctx, &http_api),
