@@ -1,5 +1,28 @@
 # Release Notes
 
+## colony 1.2.0 — 2026-10-30 (WIB, UTC+7)
+
+### New
+
+- **Auto-discovery of unregistered Claude sessions.** `colony list` and Telegram `/list` now also show Claude Code sessions that have no name in colony, marked `claude*` with a `* not registered` line. Their name is the one set with Claude's `/rename` (read from `~/.claude/sessions`), or the pane id if none is found. Nothing is written to `names.json`.
+- **Target them by that name.** `send`, `read`, `wait`, `close`, `/send` and `/last` accept a discovered name; a registered name wins, then a pane id, then a unique discovered name (a name shared by several sessions is an error listing their pane ids).
+- **`/use <name>`** sets the default session for plain-text phone messages; `/use` shows it and `/use off` clears it. It is the same setting as `colony telegram receiver`; the last one set wins. Plain text with no default gets "❓ no session selected, use /use <name> or /send <name> <msg>".
+- **`/` command menu.** The bot registers `list`, `use`, `send`, `last` and `help` with Telegram every time it starts and at `connect`, so they show in the chat menu. A failure is logged and never stops the bot.
+- **Busy and blocked notice.** A message to a `working` session is acknowledged with "📨 sent to <name> (⏳ busy — it will answer after its current task)". A session waiting on a prompt is not sent to: "⛔ not delivered: <name> is waiting on a prompt", and no reply ID is left behind.
+
+- **Tidier phone replies.** The Telegram envelope now asks sessions for a phone-friendly format (result first, one fact per line with •, no long paragraphs). `colony telegram reply` renders simple Markdown in Telegram (`**bold**`, `` `code` ``, fenced blocks, `-`/`*` bullets, `#` headings); anything else is escaped. If Telegram rejects a message, that part is resent once as plain text, so nothing is lost.
+- **Sender header on replies.** Every `colony telegram reply` starts with `🤖 **NAME**`, a `━━━━━━━━━━━━━━` line and an empty line, so the chat shows which session answered. NAME is the replying session's registered colony name, else its `/rename` name, else its pane id (outside herdr/tmux: the reply target's name, else `colony`), upper-cased and escaped. When a reply is split, only the first message has it. Sessions must not add their own header.
+- **Emoji.** Bot replies carry emoji: status dots in `/list` (🟢 idle, 🟡 working, 🔴 blocked, ⚪ unknown), 📨 on acknowledgements, ⛔ not delivered, 🎯 default session, 🔒 lock, ⚠️ on errors, one per `/help` line; they stay plain text. The Telegram envelope also asks sessions for a few fitting emoji (✅ ❌ ⏳ ⚠️ 📌).
+
+### Download
+
+Download `colony-1.2.0-x86_64-linux.tar.gz` (static Linux x86_64 build, with a `.sha256` file), then:
+
+```bash
+tar xzf colony-1.2.0-x86_64-linux.tar.gz
+./colony --help
+```
+
 ## colony 1.1.0 — 2026-10-30 (WIB, UTC+7)
 
 ### Changed

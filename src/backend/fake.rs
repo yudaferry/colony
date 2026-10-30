@@ -23,6 +23,8 @@ pub struct FakeBackend {
     pub commands: RefCell<HashMap<String, String>>,
     /// Panes whose screen `screen_is_claude` reports as Claude.
     pub claude_screens: RefCell<Vec<String>>,
+    /// Claude PIDs per pane, returned by `claude_pids`.
+    pub pids: RefCell<HashMap<String, Vec<u32>>>,
     /// Makes `close` fail with this message.
     pub close_error: RefCell<Option<String>>,
     next_id: Cell<u32>,
@@ -38,7 +40,7 @@ impl FakeBackend {
             kind,
             panes: RefCell::new(vec![PaneInfo {
                 pane_id: current.to_string(),
-                agent: None,
+                ..Default::default()
             }]),
             log: RefCell::new(Vec::new()),
             fail_list: Cell::new(false),
@@ -48,6 +50,7 @@ impl FakeBackend {
             read_text: RefCell::new(String::new()),
             commands: RefCell::new(HashMap::new()),
             claude_screens: RefCell::new(Vec::new()),
+            pids: RefCell::new(HashMap::new()),
             close_error: RefCell::new(None),
             next_id: Cell::new(100),
         }
@@ -71,6 +74,27 @@ impl FakeBackend {
         self.panes.borrow_mut().push(PaneInfo {
             pane_id: pane_id.to_string(),
             agent: agent.map(|(k, s)| (k.to_string(), s)),
+            ..Default::default()
+        });
+    }
+
+    /// A herdr-style Claude pane (agent `claude`) with a terminal title.
+    pub fn add_claude(&self, pane_id: &str, state: AgentState, title: Option<&str>) {
+        self.panes.borrow_mut().push(PaneInfo {
+            pane_id: pane_id.to_string(),
+            agent: Some(("claude".to_string(), state)),
+            title: title.map(str::to_string),
+            ..Default::default()
+        });
+    }
+
+    /// A tmux-style pane with a foreground command and a title.
+    pub fn add_command_pane(&self, pane_id: &str, command: &str, title: Option<&str>) {
+        self.panes.borrow_mut().push(PaneInfo {
+            pane_id: pane_id.to_string(),
+            command: Some(command.to_string()),
+            title: title.map(str::to_string),
+            ..Default::default()
         });
     }
 }
@@ -100,7 +124,7 @@ impl Backend for FakeBackend {
         };
         self.panes.borrow_mut().push(PaneInfo {
             pane_id: id.clone(),
-            agent: None,
+            ..Default::default()
         });
         let cwd = cwd.map(|p| p.display().to_string()).unwrap_or_default();
         self.record(format!("split {from_pane} {dir:?} {cwd}"));
@@ -116,7 +140,7 @@ impl Backend for FakeBackend {
         };
         self.panes.borrow_mut().push(PaneInfo {
             pane_id: id.clone(),
-            agent: None,
+            ..Default::default()
         });
         let cwd = cwd.map(|p| p.display().to_string()).unwrap_or_default();
         match column.last() {
@@ -201,6 +225,10 @@ impl Backend for FakeBackend {
 
     fn screen_is_claude(&self, pane: &str) -> bool {
         self.claude_screens.borrow().iter().any(|p| p == pane)
+    }
+
+    fn claude_pids(&self, pane: &PaneInfo) -> Vec<u32> {
+        self.pids.borrow().get(&pane.pane_id).cloned().unwrap_or_default()
     }
 }
 

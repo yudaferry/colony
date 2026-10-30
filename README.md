@@ -11,7 +11,7 @@ colony is a single command-line tool. It opens, names and messages terminal pane
 - **Session-to-session messages** — `colony send` wraps the text in a `[COLONY MSG]` envelope that tells the receiver who sent it and how to reply.
 - **Read and wait** — show a session's recent output, or wait until it is idle (herdr).
 - **Tidy layout** — the lead pane keeps the left half; spawned panes stack in a right column with equal heights.
-- **Telegram bot** — `/list`, `/send`, `/last` from your phone; sessions answer with `colony telegram reply`, which goes straight to the chat. Only you can use the bot.
+- **Telegram bot** — `/list`, `/use`, `/send`, `/last` from your phone; sessions answer with `colony telegram reply`, which goes straight to the chat under a `🤖 NAME` header that colony adds itself. Only you can use the bot.
 - **No Claude hooks** — sessions reply by running a colony command.
 
 ## Install
@@ -69,7 +69,7 @@ colony close api                                       # close it
 
 | Command | What it does |
 |---|---|
-| `colony list` | Name, pane, backend, kind, status (herdr: idle / working / blocked), cwd |
+| `colony list` | Name, pane, backend, kind, status (herdr: idle / working / blocked), cwd. Also lists Claude sessions that are not registered, marked `claude*` (see below) |
 | `colony register <name> [pane-id]` | Name an existing pane (default: the current one) |
 | `colony spawn [<cmd>] [<name>] [--cwd DIR] [--bypass] [--direction right\|down]` | Open a pane; `claude` starts Claude Code; no command opens a shell |
 | `colony split` | Same as `colony spawn` with no command |
@@ -81,6 +81,8 @@ colony close api                                       # close it
 | `colony telegram status` / `disconnect` | Show (incl. running pid) / stop the bot |
 | `colony telegram receiver <name>` / `--clear` | Set / clear the session that gets plain-text messages |
 | `colony telegram reply <id> "<text>"` | Send an answer straight to the Telegram chat |
+
+**Unregistered Claude sessions.** `colony list` and Telegram `/list` also show every Claude Code session the backends can see that has no name in colony, with kind `claude*` and a `* not registered` line. They are shown only; nothing is written to `names.json`. Their name is the Claude session name (set with Claude's `/rename`), or the pane id when none is found. `send`, `read`, `wait`, `close`, `/send` and `/last` accept that name too: a registered name wins, then a raw pane id, then a unique discovered name (a name shared by several sessions is an error that lists their pane ids). Discovered sessions get the Claude envelope.
 
 `--bypass` starts Claude with `--dangerously-skip-permissions`. In a folder Claude has not trusted yet, `spawn` stops and asks you to accept Claude's prompt in the new pane instead of answering it for you.
 
@@ -95,10 +97,13 @@ From your phone:
 | Message | Effect |
 |---|---|
 | `/list` | List sessions |
-| `/send <name> <message>` | Send to a session; it answers straight to the chat |
+| `/use <name>` / `/use off` / `/use` | Set, clear or show the default session for plain text (same setting as `colony telegram receiver`; the last one set wins) |
+| `/send <name> <message>` | Send to a session; it answers straight to the chat. A busy session is told so; one waiting on a prompt is not sent to |
 | `/last <name> [lines]` | Show a session's recent output |
 | `/help` | List commands |
-| plain text | Goes to the receiver session, if one is set |
+| plain text | Goes to the default session (`/use`), if one is set |
+
+The bot registers these commands with Telegram each time it starts, so the `/` menu in the chat lists them.
 
 Answers reach Telegram only for messages that came from Telegram.
 

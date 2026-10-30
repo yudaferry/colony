@@ -116,6 +116,56 @@ impl<R: Runner> Tmux<R> {
     }
 }
 
+/// One `list-panes` call carries everything discovery needs. The title is last because
+/// it is free text.
+const LIST_FORMAT: &str =
+    "#{pane_id}\t#{pane_pid}\t#{pane_current_command}\t#{host}\t#{host_short}\t#{pane_title}";
+
+/// A title that is empty or only the host name (tmux's default) carries no information.
+fn parse_pane_line(line: &str) -> Option<PaneInfo> {
+    let mut f = line.splitn(6, '\t');
+    let id = f.next()?.trim();
+    if id.is_empty() {
+        return None;
+    }
+    let pid = f.next().and_then(|p| p.trim().parse::<u32>().ok());
+    let command = f.next().map(str::trim).filter(|c| !c.is_empty()).map(str::to_string);
+    let host = f.next().unwrap_or("").trim();
+    let host_short = f.next().unwrap_or("").trim();
+    let title = f
+        .next()
+        .map(str::trim)
+        .filter(|t| !t.is_empty() && *t != host && *t != host_short)
+        .map(str::to_string);
+    Some(PaneInfo {
+        pane_id: id.to_string(),
+        pid,
+        command,
+        title,
+        ..Default::default()
+    })
+}
+
+/// `pid` and its descendants (breadth first, at most `LIMIT` PIDs), from /proc.
+fn process_tree(pid: u32) -> Vec<u32> {
+    const LIMIT: usize = 32;
+    let mut all = vec![pid];
+    let mut i = 0;
+    while i < all.len() && all.len() < LIMIT {
+        let dir = format!("/proc/{}/task", all[i]);
+        if let Ok(tasks) = std::fs::read_dir(dir) {
+            for t in tasks.flatten() {
+                if let Ok(kids) = std::fs::read_to_string(t.path().join("children")) {
+                    all.extend(kids.split_whitespace().filter_map(|k| k.parse::<u32>().ok()));
+                }
+            }
+        }
+        i += 1;
+    }
+    all.truncate(LIMIT);
+    all
+}
+
 fn is_shell(cmd: &str) -> bool {
     matches!(cmd, "zsh" | "bash" | "sh")
 }
@@ -152,16 +202,8 @@ impl<R: Runner> Backend for Tmux<R> {
     }
 
     fn list_panes(&self) -> Result<Vec<PaneInfo>> {
-        let out = self.tmux(&["list-panes", "-a", "-F", "#{pane_id}"])?;
-        Ok(out
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(|id| PaneInfo {
-                pane_id: id.to_string(),
-                agent: None,
-            })
-            .collect())
+        let out = self.tmux(&["list-panes", "-a", "-F", LIST_FORMAT])?;
+        Ok(out.lines().filter_map(parse_pane_line).collect())
     }
 
     fn split(&self, from_pane: &str, dir: Direction, cwd: Option<&Path>) -> Result<String> {
@@ -279,6 +321,10 @@ impl<R: Runner> Backend for Tmux<R> {
     fn screen_is_claude(&self, pane: &str) -> bool {
         self.tmux(&["capture-pane", "-p", "-t", pane])
             .is_ok_and(|s| claude_ready(&s.to_lowercase()))
+    }
+
+    fn claude_pids(&self, pane: &PaneInfo) -> Vec<u32> {
+        pane.pid.map(process_tree).unwrap_or_default()
     }
 
     fn pane_command(&self, pane: &str) -> Result<Option<String>> {
@@ -559,14 +605,18 @@ mod tests {
     #[test]
     fn close_and_list_and_current_argv() {
         let t = tmux();
-        t.runner().push_ok("%1\n%2\n");
+        t.runner().push_ok("%1\t10\tzsh\tbox\tbox\tbox\n%2\t11\tclaude\tbox\tbox\t\u{2733} report-server\n");
         let panes = t.list_panes().unwrap();
         assert_eq!(panes.iter().map(|p| p.pane_id.as_str()).collect::<Vec<_>>(), ["%1", "%2"]);
+        assert_eq!(panes[0].title, None);
+        assert_eq!(panes[0].command.as_deref(), Some("zsh"));
+        assert_eq!(panes[1].pid, Some(11));
+        assert_eq!(panes[1].title.as_deref(), Some("\u{2733} report-server"));
         t.close("%2").unwrap();
         assert_eq!(
             t.runner().calls(),
             vec![
-                sv(&["tmux", "list-panes", "-a", "-F", "#{pane_id}"]),
+                sv(&["tmux", "list-panes", "-a", "-F", LIST_FORMAT]),
                 sv(&["tmux", "kill-pane", "-t", "%2"]),
             ]
         );

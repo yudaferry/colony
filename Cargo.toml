@@ -1,6 +1,6 @@
 [package]
 name = "colony"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2024"
 description = "Drive herdr and tmux panes and run a locked Telegram bot"
 

@@ -25,7 +25,7 @@ On a polling error the bot waits 5 seconds and retries. The API client is rebuil
 ## Who can use it (the lock)
 
 - Only **private chats** are handled. Group chats, messages without text and updates without a sender are ignored.
-- After `connect`, the **first private message** locks the bot to its sender (user id and chat id). That message is not run as a command; the bot answers "locked to you, send /help".
+- After `connect`, the **first private message** locks the bot to its sender (user id and chat id). That message is not run as a command; the bot answers "🔒 locked to you, send /help".
 - Everyone else is **ignored silently**.
 - Messages dated **at or before the connect time** are ignored entirely, so a backlog Telegram replays from before `connect` cannot claim the lock or run commands. Dates have one-second resolution, so a message in the exact connect second is dropped too; send it again.
 - Without a connect time nobody can claim the lock.
@@ -40,19 +40,42 @@ Telegram command names allow only `a-z 0-9 _`, so the list command is `/list`.
 
 | Message | Action |
 |---|---|
-| `/list` | one line per session: name, kind, status, backend and pane |
-| `/send <name> <message>` | forward with a Telegram envelope; the bot answers "sent to <name>" |
+| `/list` | one line per session: name, kind, status, backend and pane; unregistered Claude sessions are included, kind `claude*`, with a `* not registered` line |
+| `/use <name>` | set the default session for plain text; `<name>` resolves like `/send` (registered name, pane id or discovered name); unknown or ambiguous: error reply, nothing changed |
+| `/use` | show the current default session |
+| `/use off` | clear the default session |
+| `/send <name> <message>` | `<name>` is a registered or discovered name or a pane id; forward with a Telegram envelope; the bot answers "📨 sent to <name>" (see Busy and blocked sessions) |
 | `/last <name> [lines]` | recent output (default 50, at most 1000 lines), trimmed to the last lines that fit one message |
 | `/help` (or anything unknown) | list the commands |
-| plain text | forward to the receiver session |
+| plain text | forward to the default session (`/use`) |
 
-Plain text with no receiver set gets "no receiver set, use /send". If the receiver's pane is gone, "receiver <name> not found, use /send". A name that is not a live session gets "no session named <name>".
+Plain text with no default session gets "❓ no session selected, use /use <name> or /send <name> <msg>". If the default session's pane is gone, "⚠️ receiver <name> not found, use /send". A name that is not a live session gets "⚠️ no session named <name>". `/use <name>` answers "🎯 default session: <name>" and `/use off` "🎯 default session cleared".
 
-Answers are sent as plain text (no Markdown parsing) and split at Telegram's 4096-unit limit; only the first chunk quotes the original message.
+Bot answers (`/list`, `/last`, errors) are sent as plain text (no Markdown parsing) with emoji: `/list` rows start with a status dot (🟢 idle, 🟡 working, 🔴 blocked, ⚪ unknown or tmux), errors start with ⚠️, and each `/help` line has one emoji and split at Telegram's 4096-unit limit; only the first chunk quotes the original message.
+
+`colony telegram reply` renders simple Markdown as Telegram HTML (`parse_mode` HTML): `**bold**`/`__bold__`, `` `code` ``, fenced blocks, `- `/`* ` bullets (shown as `•`) and `#` headings; `&`, `<` and `>` are escaped. It splits on line boundaries after conversion (a fenced block spanning chunks is closed and reopened). If Telegram rejects a chunk (for example "can't parse entities"), that chunk is resent once as the original plain text. Tables are not rendered.
+
+Every reply starts with a sender header, added by colony (sessions must not add their own). The name is the session that ran `reply`: its registered colony name, else its discovered display name, else its pane id; outside a multiplexer it is the target name of the reply ID, else `colony`. The name is upper-cased, bold and escaped. The header is only on the first message when a reply is split, and it stays in the plain-text fallback. Example (14 `━`):
+
+```
+🤖 **BO-SERVER**
+━━━━━━━━━━━━━━
+
+✅ Build passed
+• 142 tests green
+```
+
+## Command menu
+
+Every time the bot loop starts (and at `connect`, before the bot runs) it registers `list`, `use`, `send`, `last` and `help` with the Bot API `setMyCommands`, so Telegram shows them in the `/` menu. If that call fails the error is logged to stderr and the bot runs on.
+
+## Busy and blocked sessions
+
+When `/send` or plain text reaches a herdr session whose status is `working`, the answer is "📨 sent to <name> (⏳ busy — it will answer after its current task)". An idle session gets "📨 sent to <name>", and so does a tmux session (it has no status). A session that is `blocked` (waiting on a prompt) is not sent to: the answer is "⛔ not delivered: <name> is waiting on a prompt", and no reply ID is created.
 
 ## Receiver session
 
-`colony telegram receiver <name>` picks a session that gets plain-text messages; `--clear` removes it. It is optional: the slash commands work without one, use no Claude tokens and still work if the receiver is down. A Claude session can make itself the receiver when you ask it to. The receiver sees the Telegram envelope and may forward the message to another session with `--from telegram:<id>`.
+`/use <name>` and `colony telegram receiver <name>` are the same setting (`receiver` in `telegram.json`); whichever was set last wins. `colony telegram receiver <name>` picks a session that gets plain-text messages; `--clear` removes it. It is optional: the slash commands work without one, use no Claude tokens and still work if the receiver is down. A Claude session can make itself the receiver when you ask it to. The receiver sees the Telegram envelope and may forward the message to another session with `--from telegram:<id>`.
 
 ## Reply flow
 

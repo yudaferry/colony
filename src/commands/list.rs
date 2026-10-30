@@ -3,6 +3,7 @@
 use super::{backend_str, kind_str, state_str};
 use crate::backend::{BackendKind, Kind};
 use crate::ctx::Ctx;
+use crate::discover::discover;
 use crate::state::names::{NAMES_FILE, Names};
 use anyhow::Result;
 
@@ -15,9 +16,21 @@ pub struct ListRow {
     pub kind: Kind,
     pub status: String,
     pub cwd: String,
+    /// False for a Claude session found by discovery (never in `names.json`).
+    pub registered: bool,
 }
 
-/// Rows for every registered pane. Stale names (backend answered, pane absent)
+impl ListRow {
+    /// `claude*` marks an unregistered session.
+    pub fn kind_label(&self) -> String {
+        format!("{}{}", kind_str(self.kind), if self.registered { "" } else { "*" })
+    }
+}
+
+pub const UNREGISTERED_NOTE: &str = "* not registered";
+
+/// Rows for every registered pane, then every unregistered Claude session the backends
+/// can see (one `list_panes` per backend; an unreachable backend adds nothing). Stale names (backend answered, pane absent)
 /// are removed from `names.json`; if a backend query fails the entries stay and
 /// show status `?` (D-18).
 pub fn list_rows(ctx: &Ctx) -> Result<Vec<ListRow>> {
@@ -25,9 +38,6 @@ pub fn list_rows(ctx: &Ctx) -> Result<Vec<ListRow>> {
     let mut rows = Vec::new();
     let mut stale: Vec<(BackendKind, String)> = Vec::new();
     for backend in [BackendKind::Herdr, BackendKind::Tmux] {
-        if !names.0.values().any(|e| e.backend == backend) {
-            continue;
-        }
         let panes = ctx.backends.get(backend).list_panes();
         for (name, e) in names.0.iter().filter(|(_, e)| e.backend == backend) {
             let status = match &panes {
@@ -50,7 +60,21 @@ pub fn list_rows(ctx: &Ctx) -> Result<Vec<ListRow>> {
                 kind: e.kind,
                 status,
                 cwd: e.cwd.clone().filter(|c| !c.is_empty()).unwrap_or_else(|| DASH.to_string()),
+                registered: true,
             });
+        }
+        if let Ok(ps) = &panes {
+            for d in discover(ctx, backend, ps, &names) {
+                rows.push(ListRow {
+                    name: d.name,
+                    pane_id: d.pane_id,
+                    backend,
+                    kind: Kind::Claude,
+                    status: d.state.map_or_else(|| DASH.to_string(), |s| state_str(s).to_string()),
+                    cwd: d.cwd.filter(|c| !c.is_empty()).unwrap_or_else(|| DASH.to_string()),
+                    registered: false,
+                });
+            }
         }
     }
     if !stale.is_empty() {
@@ -74,14 +98,15 @@ pub fn list(ctx: &Ctx) -> Result<String> {
         "STATUS".into(),
         "CWD".into(),
     ]];
+    let any_unregistered = rows.iter().any(|r| !r.registered);
     for r in rows {
         table.push([
-            r.name,
-            r.pane_id,
+            r.name.clone(),
+            r.pane_id.clone(),
             backend_str(r.backend).to_string(),
-            kind_str(r.kind).to_string(),
-            r.status,
-            r.cwd,
+            r.kind_label(),
+            r.status.clone(),
+            r.cwd.clone(),
         ]);
     }
     let mut widths = [0usize; 6];
@@ -104,6 +129,10 @@ pub fn list(ctx: &Ctx) -> Result<String> {
             }
         }
         out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    if any_unregistered {
+        out.push_str(UNREGISTERED_NOTE);
         out.push('\n');
     }
     Ok(out)

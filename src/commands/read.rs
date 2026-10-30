@@ -2,12 +2,12 @@
 
 use crate::ctx::Ctx;
 use crate::state::names::{NAMES_FILE, Names};
-use crate::target::resolve;
+use crate::discover::resolve;
 use anyhow::Result;
 
 pub fn read(ctx: &Ctx, target: &str, lines: usize) -> Result<String> {
     let names: Names = ctx.state.read_json(NAMES_FILE)?;
-    let t = resolve(target, &names)?;
+    let t = resolve(ctx, target, &names)?;
     let text = ctx.backends.get(t.backend).read(&t, lines)?;
     let all: Vec<&str> = text.lines().collect();
     let start = all.len().saturating_sub(lines);

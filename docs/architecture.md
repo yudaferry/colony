@@ -54,6 +54,17 @@ State lives in `~/.colony/` (created with mode 700):
 
 Names are stored lower-case. Entries whose pane no longer exists are dropped by `colony list`.
 
+### Auto-discovery of Claude sessions
+
+`colony list` and `/list` also show Claude Code sessions that are not in `names.json` (`src/discover.rs`). This is read only: discovered rows are never stored. It reuses the one `list_panes` answer per backend (no extra listing); an unreachable backend is skipped without a message.
+
+- **Which panes.** herdr: `pane list` entries whose agent is `claude`. tmux: panes whose `pane_current_command` is `claude`, or a shell pane whose screen shows Claude's markers (the same detection `register` uses).
+- **Name, best source first.**
+  1. `~/.claude/sessions/<pid>.json`, field `name`, for the Claude process in the pane (`$CLAUDE_CONFIG_DIR` is honoured). Claude Code writes one such file per running process, with `pid`, `sessionId`, `cwd`, `name` and `nameSource` (`user` for `/rename`, `derived` for an automatic name). The name may be wrapped in quotes; they are stripped. The PID comes from `herdr pane process-info --pane <id>` (foreground processes) or, on tmux, from `#{pane_pid}` and its child processes in `/proc`. This is the authoritative source and is only read for unregistered Claude panes.
+  2. The terminal title (herdr `terminal_title_stripped`, tmux `#{pane_title}`), only if it looks like a name: after removing a leading spinner glyph and quotes it is a single word. Claude puts the `/rename` name there, but an unrenamed session shows a task summary ("Merging test-bo into prod-bo-a"), which is rejected. A title equal to the host name (tmux default) is ignored.
+  3. The pane id.
+- **Targeting.** `target::resolve` is unchanged (registered name, then raw pane id). `discover::resolve` adds a third step: a unique discovered name, compared case-insensitively. Several matches is an error naming the pane ids. The target is a Claude pane, so the envelope applies; it has no colony name, so herdr is addressed by pane id.
+
 ### Atomic, locked writes
 
 Every change to a JSON state file is a read-modify-write under one exclusive lock on `~/.colony/.lock` (`StateDir::update_json`). The new content is written to `<file>.tmp.<pid>` with the final mode, fsynced and renamed over the target. If the update closure fails, nothing is written. This keeps the bot and any number of CLI calls from losing each other's changes; a test runs four threads doing 25 increments each and checks that none are lost.
@@ -66,6 +77,7 @@ Every change to a JSON state file is a read-modify-write under one exclusive loc
 | `src/cli.rs` | `clap` command definitions and the `--from telegram:<id>` origin |
 | `src/ctx.rs` | `Ctx` (state, backends, env, clock) and the `Clock` / `Env` traits, with fixed and map-based fakes |
 | `src/target.rs` | resolves a name or pane id to a target |
+| `src/discover.rs` | finds unregistered Claude sessions; resolves their names |
 | `src/envelope.rs` | message envelopes and the spawn intro ([messaging](messaging.md)) |
 | `src/time.rs` | timestamps shown to the user and in the log (UTC+7, labelled WIB) |
 | `src/backend/` | `Backend` trait, `herdr.rs`, `tmux.rs`, `runner.rs` (process runner and a recording fake), `fake.rs` (in-memory backend) |

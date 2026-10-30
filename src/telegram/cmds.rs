@@ -2,7 +2,8 @@
 //! The bot token never appears in output, errors or logs.
 
 use super::api::TelegramApi;
-use super::split::{TG_LIMIT, split_message};
+use super::format::send_markdown;
+use crate::discover::discover;
 use crate::backend::{Direction, detect_env};
 use crate::commands::log;
 use crate::ctx::Ctx;
@@ -34,11 +35,9 @@ pub fn reply(ctx: &Ctx, api: &dyn TelegramApi, reply_id: &str, text: &str) -> Re
     let Some(entry) = pending.get_valid(reply_id, ctx.clock.now()) else {
         bail!("reply id {reply_id} unknown or expired (valid 24 h)");
     };
-    let chunks = split_message(text, TG_LIMIT);
-    for (i, chunk) in chunks.iter().enumerate() {
-        let reply_to = (i == 0).then_some(entry.message_id);
-        api.send_message(entry.chat_id, chunk, reply_to)?;
-    }
+    let names: Names = ctx.state.read_json(NAMES_FILE)?;
+    let sender = sender_name(ctx, &names, &entry.target);
+    send_markdown(api, entry.chat_id, text, Some(entry.message_id), Some(&sender))?;
     log(
         ctx,
         &LogEvent::Reply {
@@ -47,6 +46,32 @@ pub fn reply(ctx: &Ctx, api: &dyn TelegramApi, reply_id: &str, text: &str) -> Re
         },
     );
     Ok(format!("Sent to Telegram (reply id {reply_id})"))
+}
+
+/// Name for the reply header: the calling pane's registered name, else its discovered
+/// display name, else its pane id. When the pane is unknown: the pending target, else "colony".
+fn sender_name(ctx: &Ctx, names: &Names, target: &str) -> String {
+    let fallback = if target.trim().is_empty() { "colony" } else { target };
+    let Ok(kind) = detect_env(ctx.env) else {
+        return fallback.to_string();
+    };
+    let backend = ctx.backends.get(kind);
+    let Ok(pane) = backend.current_pane() else {
+        return fallback.to_string();
+    };
+    if let Some(n) = names.name_of_pane(kind, &pane) {
+        return n.to_string();
+    }
+    backend
+        .list_panes()
+        .ok()
+        .and_then(|ps| {
+            discover(ctx, kind, &ps, names)
+                .into_iter()
+                .find(|d| d.pane_id == pane)
+                .map(|d| d.name)
+        })
+        .unwrap_or(pane)
 }
 
 /// Bot id is the part of the token before `:`.
@@ -103,9 +128,12 @@ pub fn connect(
     new_pane: bool,
 ) -> Result<Connected> {
     let token = token.trim();
-    let info = api_for(token)
+    let api = api_for(token);
+    let info = api
         .get_me()
         .map_err(|e| anyhow!("could not validate the bot token: {e}"))?;
+    // The `/` menu is set before the bot runs; failure is only logged.
+    super::bot::register_commands(ctx, api.as_ref());
 
     let before = read_config(ctx)?;
     let live = before.live_bot_pid();
@@ -326,6 +354,102 @@ mod tests {
             .unwrap();
     }
 
+    /// Expected plain-text header for an upper-case name.
+    fn hdr(name: &str) -> String {
+        format!("\u{1f916} {name}\n{}\n\n", "\u{2501}".repeat(14))
+    }
+
+    fn hdr_html(name: &str) -> String {
+        format!("\u{1f916} <b>{name}</b>\n{}\n\n", "\u{2501}".repeat(14))
+    }
+
+    #[test]
+    fn header_uses_registered_name() {
+        let h = Harness::herdr();
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(1));
+        h.add_name("bo-server", BackendKind::Herdr, "w1:p1", Kind::Claude);
+        let api = FakeTelegram::new();
+        reply(&h.ctx(), &api, "k3f9qa", "**ok** done").unwrap();
+        assert_eq!(
+            *api.html_sent.borrow(),
+            vec![(42, format!("{}<b>ok</b> done", hdr_html("BO-SERVER")), Some(7))]
+        );
+    }
+
+    #[test]
+    fn header_uses_discovered_name() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".claude/sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("77.json"), r#"{"pid":77,"sessionId":"x","name":"report-server"}"#).unwrap();
+        let h = Harness::new(&[
+            ("HERDR_ENV", "1"),
+            ("HERDR_PANE_ID", "w1:p1"),
+            ("HOME", home.path().to_str().unwrap()),
+        ]);
+        h.backends.herdr.panes.borrow_mut().clear();
+        h.backends.herdr.add_claude("w1:p1", crate::backend::AgentState::Working, None);
+        h.backends.herdr.pids.borrow_mut().insert("w1:p1".into(), vec![77]);
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(1));
+        let api = FakeTelegram::new();
+        reply(&h.ctx(), &api, "k3f9qa", "hi").unwrap();
+        assert_eq!(api.sent.borrow()[0].1, format!("{}hi", hdr_html("REPORT-SERVER")));
+    }
+
+    #[test]
+    fn header_falls_back_to_pending_target_then_colony() {
+        let h = Harness::new(&[]);
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(1));
+        let api = FakeTelegram::new();
+        reply(&h.ctx(), &api, "k3f9qa", "hi").unwrap();
+        assert_eq!(api.sent.borrow()[0].1, format!("{}hi", hdr_html("BO")));
+        assert_eq!(sender_name(&h.ctx(), &h.names(), ""), "colony");
+    }
+
+    #[test]
+    fn header_only_on_first_chunk() {
+        let h = Harness::herdr();
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(1));
+        h.add_name("bo", BackendKind::Herdr, "w1:p1", Kind::Claude);
+        let api = FakeTelegram::new();
+        let text = (0..1500).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        reply(&h.ctx(), &api, "k3f9qa", &text).unwrap();
+        let sent = api.sent.borrow();
+        assert!(sent.len() > 1);
+        assert!(sent[0].1.starts_with(&hdr_html("BO")));
+        assert!(sent[1..].iter().all(|m| !m.1.contains('\u{1f916}') && !m.1.contains('\u{2501}')));
+        assert!(sent.iter().all(|m| m.1.encode_utf16().count() <= 4096));
+    }
+
+    #[test]
+    fn html_fallback_keeps_header() {
+        let h = Harness::herdr();
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(1));
+        h.add_name("bo", BackendKind::Herdr, "w1:p1", Kind::Claude);
+        let api = FakeTelegram::new();
+        api.reject_html.set(true);
+        reply(&h.ctx(), &api, "k3f9qa", "**x**").unwrap();
+        assert_eq!(api.sent.borrow()[0].1, format!("{}**x**", hdr("BO")));
+    }
+
+    #[test]
+    fn header_name_is_escaped() {
+        let h = Harness::herdr();
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(1));
+        h.add_name("a<b>&**c", BackendKind::Herdr, "w1:p1", Kind::Claude);
+        let api = FakeTelegram::new();
+        reply(&h.ctx(), &api, "k3f9qa", "hi").unwrap();
+        let m = &api.sent.borrow()[0].1;
+        assert!(m.starts_with("\u{1f916} <b>A&lt;B&gt;&amp;**C</b>\n"), "{m}");
+        assert_eq!(m.matches("<b>").count(), 1);
+    }
+
     fn exe() -> &'static Path {
         Path::new("/usr/bin/colony")
     }
@@ -341,7 +465,7 @@ mod tests {
         add_pending(&h, "k3f9qa", Duration::minutes(5));
         let api = FakeTelegram::new();
         reply(&h.ctx(), &api, "k3f9qa", "done").unwrap();
-        assert_eq!(*api.sent.borrow(), vec![(42, "done".to_string(), Some(7))]);
+        assert_eq!(*api.sent.borrow(), vec![(42, format!("{}done", hdr_html("W1:P1")), Some(7))]);
     }
 
     #[test]
@@ -452,6 +576,34 @@ mod tests {
         let cfg: TelegramConfig = h.state.read_json(TELEGRAM_FILE).unwrap();
         assert_eq!(cfg.token, None);
         assert!(h.backends.herdr.log.borrow().is_empty());
+    }
+
+    #[test]
+    fn connect_registers_command_menu_and_survives_failure() {
+        use std::rc::Rc;
+        struct Shared(Rc<FakeTelegram>);
+        impl TelegramApi for Shared {
+            fn get_me(&self) -> Result<super::super::api::BotInfo> {
+                self.0.get_me()
+            }
+            fn get_updates(&self, o: i64, t: u64) -> Result<Vec<super::super::api::Update>> {
+                self.0.get_updates(o, t)
+            }
+            fn send_message(&self, c: i64, t: &str, r: Option<i64>) -> Result<()> {
+                self.0.send_message(c, t, r)
+            }
+            fn set_my_commands(&self, c: &[(&str, &str)]) -> Result<()> {
+                self.0.set_my_commands(c)
+            }
+        }
+        let fake = Rc::new(FakeTelegram::new());
+        let f = |_t: &str| -> Box<dyn TelegramApi> { Box::new(Shared(fake.clone())) };
+        let h = Harness::herdr();
+        connect(&h.ctx(), &f, "111:SECRET", exe(), false).unwrap();
+        assert_eq!(fake.commands.borrow().len(), 1);
+        let h2 = Harness::herdr();
+        fake.fail_commands.set(true);
+        assert!(connect(&h2.ctx(), &f, "111:SECRET", exe(), false).unwrap().run_here);
     }
 
     #[test]

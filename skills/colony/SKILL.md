@@ -9,7 +9,7 @@ description: Use when the user asks to spawn, start or open a Claude session or 
 
 ## First steps
 
-1. `colony list` shows named panes: name, pane id, backend, kind, status (idle/working/blocked), cwd.
+1. `colony list` shows named panes: name, pane id, backend, kind, status (idle/working/blocked), cwd. It also shows Claude sessions that are not registered, with kind `claude*` (and a `* not registered` line); their name is the Claude session name (`/rename`) or else the pane id. You can `send`/`read`/`wait`/`close` them by that name or pane id without registering; a name shared by several sessions is an error that lists pane ids.
 2. If your own pane has no name, run `colony register <name>` (e.g. `lead`) before spawning or sending, so replies can find you.
 
 ## Plain request to command
@@ -40,8 +40,8 @@ Pick a short name yourself if the user gives none, and say which one you used.
 - `colony close <name|id>` closes the pane and drops its name.
 - `colony telegram connect <token> [--new-pane]`: save the token, run the bot until Ctrl+C. `--new-pane` runs it in a `telegram-bot` pane, which is right when you run it from a Claude session.
 - `colony telegram status` shows state and pid; `colony telegram disconnect` stops the bot and deletes the token.
-- `colony telegram receiver <name>` sets the session that gets the user's plain-text phone messages; `--clear` unsets it.
-- `colony telegram reply <id> "<text>"` sends an answer to the Telegram chat.
+- `colony telegram receiver <name>` sets the session that gets the user's plain-text phone messages; `--clear` unsets it. The user can also do this from the phone with `/use <name>` (`/use off` clears, `/use` shows); both set the same default, and the last one set wins.
+- `colony telegram reply <id> "<text>"` sends an answer to the Telegram chat. colony adds a 🤖 NAME header itself, don't add your own.
 
 ## Receiving a `[COLONY MSG]` block
 
@@ -65,8 +65,19 @@ Instruction: ... colony telegram reply k3f9qa "<answer>"
 ```
 
 - ALWAYS answer with `colony telegram reply <id> "<short answer>"`. An answer in the terminal never reaches the phone.
-- Keep it short: a few lines, plain text, result first.
+- Keep it short: a few lines, result first (see Phone replies).
 - The reply id is valid for 24 hours.
+
+### Phone replies
+
+When answering a Telegram message:
+
+- First line: the result, in one line.
+- Then one fact per line, starting with `•`. About 10 lines at most.
+- Use a few fitting emoji as status markers (✅ ❌ ⏳ ⚠️ 📌), not decoration on every line.
+- No long paragraphs and no tables (Telegram cannot render them).
+- `**bold**` and `` `code` `` are fine; colony turns them into Telegram formatting.
+- Put long details in a file and say where it is.
 
 ### Acting as receiver or team leader
 

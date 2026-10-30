@@ -15,7 +15,7 @@ fn detect_kind(cmd: Option<&str>, herdr: bool) -> Kind {
 
 /// Like `detect_kind`; when the foreground program is a shell (Claude runs under a
 /// `zsh -c` wrapper in tmux), `screen_is_claude` is asked before settling on shell.
-fn detect_kind_with(cmd: Option<&str>, herdr: bool, screen_is_claude: impl Fn() -> bool) -> Kind {
+pub(crate) fn detect_kind_with(cmd: Option<&str>, herdr: bool, screen_is_claude: impl Fn() -> bool) -> Kind {
     match cmd {
         None if herdr => Kind::Shell,
         None => Kind::Other,

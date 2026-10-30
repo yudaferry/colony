@@ -38,11 +38,19 @@ pub struct PaneRef {
     pub kind: Kind,
 }
 
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct PaneInfo {
     pub pane_id: String,
     /// Agent kind (e.g. `claude`) and its state, when an agent runs in the pane.
     pub agent: Option<(String, AgentState)>,
+    /// Terminal title (herdr: `terminal_title_stripped`; tmux: `#{pane_title}`),
+    /// `None` when empty or just the host name. Claude sets it to the `/rename` name.
+    pub title: Option<String>,
+    pub cwd: Option<String>,
+    /// tmux: `#{pane_current_command}`, so discovery needs no second call.
+    pub command: Option<String>,
+    /// tmux: `#{pane_pid}` (the pane's first process).
+    pub pid: Option<u32>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -81,6 +89,11 @@ pub trait Backend {
     /// shell wrapper). Backends without a screen capture answer false.
     fn screen_is_claude(&self, _pane: &str) -> bool {
         false
+    }
+    /// PIDs of the processes in the pane that may be the Claude Code process; used to
+    /// find `~/.claude/sessions/<pid>.json`. Best effort: errors and unknowns give `[]`.
+    fn claude_pids(&self, _pane: &PaneInfo) -> Vec<u32> {
+        Vec::new()
     }
 }
 

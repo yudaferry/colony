@@ -54,9 +54,25 @@ pub trait TelegramApi {
     fn get_me(&self) -> Result<BotInfo>;
     fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<Update>>;
     fn send_message(&self, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<()>;
+    /// Sends `html` with `parse_mode` HTML. Default: plain send (for wrappers).
+    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<()> {
+        self.send_message(chat_id, html, reply_to)
+    }
+    /// Registers the `/` command menu (`setMyCommands`): `(command, description)` pairs.
+    fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<()>;
 }
 
-/// `sendMessage` body. Plain text only: no `parse_mode` (FR-41).
+/// `setMyCommands` body.
+pub fn set_my_commands_body(commands: &[(&str, &str)]) -> Value {
+    json!({
+        "commands": commands
+            .iter()
+            .map(|(c, d)| json!({ "command": c, "description": d }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `sendMessage` body. Plain text: no `parse_mode` (FR-41).
 pub fn send_message_body(chat_id: i64, text: &str, reply_to: Option<i64>) -> Value {
     let mut body = json!({ "chat_id": chat_id, "text": text });
     if let Some(id) = reply_to {
@@ -65,6 +81,13 @@ pub fn send_message_body(chat_id: i64, text: &str, reply_to: Option<i64>) -> Val
             "allow_sending_without_reply": true,
         });
     }
+    body
+}
+
+/// `sendMessage` body with `parse_mode` HTML.
+pub fn send_html_body(chat_id: i64, html: &str, reply_to: Option<i64>) -> Value {
+    let mut body = send_message_body(chat_id, html, reply_to);
+    body["parse_mode"] = json!("HTML");
     body
 }
 
@@ -164,6 +187,16 @@ impl TelegramApi for HttpTelegram {
         )?;
         Ok(())
     }
+
+    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<()> {
+        let _: Value = self.call("sendMessage", &send_html_body(chat_id, html, reply_to), SHORT_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<()> {
+        let _: Value = self.call("setMyCommands", &set_my_commands_body(commands), SHORT_TIMEOUT)?;
+        Ok(())
+    }
 }
 
 /// Stands in when the HTTP client cannot be built: every call reports why.
@@ -179,6 +212,12 @@ impl TelegramApi for FailingTelegram {
     fn send_message(&self, _chat_id: i64, _text: &str, _reply_to: Option<i64>) -> Result<()> {
         Err(anyhow!("{}", self.0))
     }
+    fn send_html(&self, _chat_id: i64, _html: &str, _reply_to: Option<i64>) -> Result<()> {
+        Err(anyhow!("{}", self.0))
+    }
+    fn set_my_commands(&self, _commands: &[(&str, &str)]) -> Result<()> {
+        Err(anyhow!("{}", self.0))
+    }
 }
 
 /// In-memory API for tests.
@@ -189,8 +228,15 @@ pub struct FakeTelegram {
     pub me: Result<BotInfo>,
     pub fail_updates: Cell<bool>,
     pub fail_send: Cell<bool>,
+    /// Makes `send_html` fail like Telegram's "can't parse entities".
+    pub reject_html: Cell<bool>,
+    /// `(chat_id, html, reply_to)` per accepted `send_html` call (also in `sent`).
+    pub html_sent: RefCell<Vec<(i64, String, Option<i64>)>>,
     /// Offsets passed to `get_updates`.
     pub offsets: RefCell<Vec<i64>>,
+    /// `(command, description)` pairs per `set_my_commands` call.
+    pub commands: RefCell<Vec<Vec<(String, String)>>>,
+    pub fail_commands: Cell<bool>,
 }
 
 impl FakeTelegram {
@@ -204,7 +250,11 @@ impl FakeTelegram {
             }),
             fail_updates: Cell::new(false),
             fail_send: Cell::new(false),
+            reject_html: Cell::new(false),
+            html_sent: RefCell::new(Vec::new()),
             offsets: RefCell::new(Vec::new()),
+            commands: RefCell::new(Vec::new()),
+            fail_commands: Cell::new(false),
         }
     }
 
@@ -248,6 +298,28 @@ impl TelegramApi for FakeTelegram {
             .push((chat_id, text.to_string(), reply_to));
         Ok(())
     }
+
+    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<()> {
+        if self.reject_html.get() {
+            return Err(anyhow!("Telegram API error: Bad Request: can't parse entities"));
+        }
+        self.send_message(chat_id, html, reply_to)?;
+        self.html_sent.borrow_mut().push((chat_id, html.to_string(), reply_to));
+        Ok(())
+    }
+
+    fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<()> {
+        if self.fail_commands.get() {
+            return Err(anyhow!("fake setMyCommands failure"));
+        }
+        self.commands.borrow_mut().push(
+            commands
+                .iter()
+                .map(|(c, d)| (c.to_string(), d.to_string()))
+                .collect(),
+        );
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -264,6 +336,23 @@ mod tests {
         let mut keys: Vec<&str> = replied.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         keys.sort();
         assert_eq!(keys, vec!["chat_id", "reply_parameters", "text"]);
+    }
+
+    #[test]
+    fn html_body_has_parse_mode() {
+        let b = send_html_body(42, "<b>x</b>", Some(7));
+        assert_eq!(b["parse_mode"], "HTML");
+        assert_eq!(b["text"], "<b>x</b>");
+        assert_eq!(b["reply_parameters"]["message_id"], 7);
+    }
+
+    #[test]
+    fn set_my_commands_body_shape() {
+        let b = set_my_commands_body(&[("list", "List"), ("use", "Use")]);
+        assert_eq!(
+            b,
+            json!({"commands":[{"command":"list","description":"List"},{"command":"use","description":"Use"}]})
+        );
     }
 
     #[test]

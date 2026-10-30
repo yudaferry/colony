@@ -4,6 +4,7 @@ pub mod backend;
 pub mod cli;
 pub mod commands;
 pub mod ctx;
+pub mod discover;
 pub mod envelope;
 pub mod state;
 pub mod target;
@@ -16,6 +17,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod tests {
     #[test]
     fn version_is_set() {
-        assert_eq!(crate::VERSION, "1.1.0");
+        assert_eq!(crate::VERSION, "1.2.0");
     }
 }

@@ -118,6 +118,18 @@ mod tests {
     }
 
     #[test]
+    fn emoji_heavy_lines_with_variation_selectors_respect_limit() {
+        let line = "\u{1f4e8}\u{26a0}\u{fe0f}\u{23f3}\u{2705} sent \u{1f7e2}\n";
+        let text = line.repeat(1_000);
+        let chunks = split_message(&text, TG_LIMIT);
+        assert!(chunks.len() >= 2);
+        for c in &chunks {
+            assert!(c.encode_utf16().count() <= TG_LIMIT);
+        }
+        assert_eq!(chunks.concat(), text);
+    }
+
+    #[test]
     fn tail_fit_keeps_last_lines() {
         assert_eq!(tail_fit("line1\nline2\nline3", 11), "line2\nline3");
         assert_eq!(tail_fit("short", 100), "short");

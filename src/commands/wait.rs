@@ -4,13 +4,13 @@ use super::state_str;
 use crate::backend::AgentState;
 use crate::ctx::Ctx;
 use crate::state::names::{NAMES_FILE, Names};
-use crate::target::resolve;
+use crate::discover::resolve;
 use anyhow::Result;
 use std::time::Duration;
 
 pub fn wait(ctx: &Ctx, target: &str, until: AgentState, timeout: Duration) -> Result<String> {
     let names: Names = ctx.state.read_json(NAMES_FILE)?;
-    let t = resolve(target, &names)?;
+    let t = resolve(ctx, target, &names)?;
     ctx.backends.get(t.backend).wait(&t, until, timeout)?;
     Ok(format!("{target} is {}", state_str(until)))
 }

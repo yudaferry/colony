@@ -5,12 +5,12 @@ use crate::backend::is_pane_gone;
 use crate::ctx::Ctx;
 use crate::state::log::LogEvent;
 use crate::state::names::{NAMES_FILE, Names};
-use crate::target::resolve;
+use crate::discover::resolve;
 use anyhow::Result;
 
 pub fn close(ctx: &Ctx, target: &str) -> Result<String> {
     let names: Names = ctx.state.read_json(NAMES_FILE)?;
-    let t = resolve(target, &names)?;
+    let t = resolve(ctx, target, &names)?;
     // A pane that is already gone (or a backend that is not running) still drops the name.
     let gone = match ctx.backends.get(t.backend).close(&t.pane_id) {
         Ok(()) => false,

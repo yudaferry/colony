@@ -7,7 +7,7 @@ colony sends text into a pane and, for Claude sessions, wraps it in an envelope 
 - **Claude panes** get an envelope.
 - **Everything else** (shells, other programs) gets the raw text followed by Enter, with no envelope. On herdr this is `pane run`; on tmux it is `send-keys`.
 
-colony decides by the kind stored in `names.json`. An unnamed raw pane id is checked: if the pane looks like a Claude session, it is treated as one.
+colony decides by the kind stored in `names.json`. An unnamed raw pane id is checked: if the pane looks like a Claude session, it is treated as one. A Claude session found by auto-discovery (not registered; see [architecture](architecture.md)) can be addressed by its session name and always gets the envelope.
 
 ## Laptop envelope
 
@@ -46,7 +46,7 @@ Instruction: This came from the user's phone. Keep the answer short. Send your a
 [/COLONY MSG]
 ```
 
-The receiving session answers with `colony telegram reply <id> "<answer>"`, which goes straight to the Telegram chat ([telegram](telegram.md)). Answering in the terminal does not reach the phone.
+The receiving session answers with `colony telegram reply <id> "<answer>"`, which goes straight to the Telegram chat ([telegram](telegram.md)); simple Markdown in the answer is rendered, with a plain-text fallback. Answering in the terminal does not reach the phone.
 
 ## Reply IDs
 

@@ -202,12 +202,40 @@ impl<R: Runner> Backend for Herdr<R> {
                         let st = a.get("agent_status").and_then(Value::as_str).unwrap_or("unknown");
                         (kind, parse_state(st))
                     });
+                let pane = ids
+                    .iter()
+                    .find(|p| p.get("pane_id").and_then(Value::as_str) == Some(id));
+                let text = |key: &str| {
+                    pane.and_then(|p| p.get(key))
+                        .and_then(Value::as_str)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                };
                 PaneInfo {
                     pane_id: id.to_string(),
                     agent,
+                    title: text("terminal_title_stripped"),
+                    cwd: text("cwd"),
+                    ..Default::default()
                 }
             })
             .collect())
+    }
+
+    /// `herdr pane process-info`: every foreground process PID of the pane.
+    fn claude_pids(&self, pane: &PaneInfo) -> Vec<u32> {
+        let Ok(v) = self.json(&["pane", "process-info", "--pane", pane.pane_id.as_str()]) else {
+            return Vec::new();
+        };
+        v.pointer("/result/process_info/foreground_processes")
+            .and_then(Value::as_array)
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p.get("pid").and_then(Value::as_u64))
+                    .filter_map(|p| u32::try_from(p).ok())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     fn split(&self, from_pane: &str, dir: Direction, cwd: Option<&Path>) -> Result<String> {

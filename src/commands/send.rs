@@ -7,7 +7,7 @@ use crate::ctx::Ctx;
 use crate::envelope;
 use crate::state::log::LogEvent;
 use crate::state::names::{NAMES_FILE, Names};
-use crate::target::resolve;
+use crate::discover::resolve;
 use anyhow::Result;
 use std::time::Duration;
 
@@ -21,7 +21,7 @@ pub fn send(
     from: Option<&Origin>,
 ) -> Result<String> {
     let names: Names = ctx.state.read_json(NAMES_FILE)?;
-    let mut t = resolve(target, &names)?;
+    let mut t = resolve(ctx, target, &names)?;
     // An unnamed raw id of a Claude pane (e.g. an unregistered spawner) still gets the envelope.
     if t.kind == Kind::Other
         && t.name.is_none()

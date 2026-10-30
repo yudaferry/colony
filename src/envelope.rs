@@ -16,7 +16,7 @@ pub fn laptop(sender: Option<&str>, reply_to: Option<&str>, text: &str) -> Strin
 /// Envelope for a message that came from the user's phone.
 pub fn telegram(reply_id: &str, text: &str) -> String {
     format!(
-        "[COLONY MSG]\nFrom: telegram (reply-id {reply_id})\nMessage: {text}\nInstruction: This came from the user's phone. Keep the answer short. Send your answer with: colony telegram reply {reply_id} \"<answer>\"\n[/COLONY MSG]"
+        "[COLONY MSG]\nFrom: telegram (reply-id {reply_id})\nMessage: {text}\nInstruction: This came from the user's phone. Keep the answer short. Reply phone-friendly: result first, then one fact per line starting with •, no long paragraphs; use a few fitting emoji (✅ done, ❌ failed, ⏳ in progress, ⚠️ warning, 📌 next step). Send your answer with: colony telegram reply {reply_id} \"<answer>\"\n[/COLONY MSG]"
     )
 }
 
@@ -69,7 +69,7 @@ mod tests {
     fn telegram_envelope() {
         assert_eq!(
             telegram("k3f9qa", "status?"),
-            "[COLONY MSG]\nFrom: telegram (reply-id k3f9qa)\nMessage: status?\nInstruction: This came from the user's phone. Keep the answer short. Send your answer with: colony telegram reply k3f9qa \"<answer>\"\n[/COLONY MSG]"
+            "[COLONY MSG]\nFrom: telegram (reply-id k3f9qa)\nMessage: status?\nInstruction: This came from the user's phone. Keep the answer short. Reply phone-friendly: result first, then one fact per line starting with •, no long paragraphs; use a few fitting emoji (✅ done, ❌ failed, ⏳ in progress, ⚠️ warning, 📌 next step). Send your answer with: colony telegram reply k3f9qa \"<answer>\"\n[/COLONY MSG]"
         );
     }
 
