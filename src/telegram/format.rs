@@ -238,28 +238,33 @@ pub fn sender_header(name: &str) -> (String, String) {
 
 /// Sends Markdown `text` as HTML chunks. A chunk Telegram rejects is resent once as
 /// plain text (its original Markdown). `reply_to` goes on the first chunk only, and so
-/// does the sender header (when `sender` is given).
+/// does the sender header (when `sender` is given). Returns the id of every message sent.
 pub fn send_markdown(
     api: &dyn TelegramApi,
     chat_id: i64,
     text: &str,
     reply_to: Option<i64>,
     sender: Option<&str>,
-) -> Result<()> {
+) -> Result<Vec<i64>> {
     let header = sender.map(sender_header);
     let (hh, hp) = header.as_ref().map_or(("", ""), |(h, p)| (h.as_str(), p.as_str()));
     // Room for the header on every chunk, so the first one stays within the limit.
     let limit = TG_LIMIT.saturating_sub(utf16_len(hh).max(utf16_len(hp)));
+    let mut ids = Vec::new();
     for (i, c) in to_chunks(text, limit).iter().enumerate() {
         let rt = if i == 0 { reply_to } else { None };
         let (h, p) = if i == 0 { (hh, hp) } else { ("", "") };
-        if c.plain_only {
-            api.send_message(chat_id, &format!("{p}{}", c.plain), rt)?;
-        } else if api.send_html(chat_id, &format!("{h}{}", c.html), rt).is_err() {
-            api.send_message(chat_id, &format!("{p}{}", c.plain), rt)?;
-        }
+        let id = if c.plain_only {
+            api.send_message(chat_id, &format!("{p}{}", c.plain), rt)?
+        } else {
+            match api.send_html(chat_id, &format!("{h}{}", c.html), rt) {
+                Ok(id) => id,
+                Err(_) => api.send_message(chat_id, &format!("{p}{}", c.plain), rt)?,
+            }
+        };
+        ids.push(id);
     }
-    Ok(())
+    Ok(ids)
 }
 
 #[cfg(test)]

@@ -11,7 +11,7 @@ colony is a single command-line tool. It opens, names and messages terminal pane
 - **Session-to-session messages** — `colony send` wraps the text in a `[COLONY MSG]` envelope that tells the receiver who sent it and how to reply.
 - **Read and wait** — show a session's recent output, or wait until it is idle (herdr).
 - **Tidy layout** — the lead pane keeps the left half; spawned panes stack in a right column with equal heights.
-- **Telegram bot** — `/list`, `/use`, `/send`, `/last` from your phone; sessions answer with `colony telegram reply`, which goes straight to the chat under a `🤖 NAME` header that colony adds itself. Only you can use the bot.
+- **Telegram bot** — `/list`, `/use` (tap a button to pick the default session), `/send`, `/last` from your phone, or swipe-reply to a session's answer to talk to that same session; sessions answer with `colony telegram reply`, which goes straight to the chat under a `🤖 NAME` header that colony adds itself. Only you can use the bot.
 - **No Claude hooks** — sessions reply by running a colony command.
 
 ## Install
@@ -97,11 +97,13 @@ From your phone:
 | Message | Effect |
 |---|---|
 | `/list` | List sessions |
-| `/use <name>` / `/use off` / `/use` | Set, clear or show the default session for plain text (same setting as `colony telegram receiver`; the last one set wins) |
+| `/use` | Buttons to pick the default session for plain text (🟢🟡🔴⚪ status, ✅ marks the current one, 🚫 off clears it) |
+| `/use <name>` / `/use off` | Set or clear the default session by typing (same setting as `colony telegram receiver`; the last one set wins) |
 | `/send <name> <message>` | Send to a session; it answers straight to the chat. A busy session is told so; one waiting on a prompt is not sent to |
 | `/last <name> [lines]` | Show a session's recent output |
 | `/help` | List commands |
 | plain text | Goes to the default session (`/use`), if one is set |
+| swipe-reply to a session's answer | Goes to the session that sent it, without changing the default (remembered 7 days in `sent.json`) |
 
 The bot registers these commands with Telegram each time it starts, so the `/` menu in the chat lists them.
 
@@ -114,6 +116,7 @@ State lives in `~/.colony/`:
 - `names.json` — pane names
 - `telegram.json` — bot token and lock (mode 600)
 - `pending.json` — open Telegram reply ids (valid 24 hours)
+- `sent.json` — which session sent each Telegram answer, for swipe-replies (mode 600, 7 days)
 - `colony.log` — one line per send, reply, spawn, close and register
 
 ## Documentation

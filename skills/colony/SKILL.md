@@ -40,7 +40,7 @@ Pick a short name yourself if the user gives none, and say which one you used.
 - `colony close <name|id>` closes the pane and drops its name.
 - `colony telegram connect <token> [--new-pane]`: save the token, run the bot until Ctrl+C. `--new-pane` runs it in a `telegram-bot` pane, which is right when you run it from a Claude session.
 - `colony telegram status` shows state and pid; `colony telegram disconnect` stops the bot and deletes the token.
-- `colony telegram receiver <name>` sets the session that gets the user's plain-text phone messages; `--clear` unsets it. The user can also do this from the phone with `/use <name>` (`/use off` clears, `/use` shows); both set the same default, and the last one set wins.
+- `colony telegram receiver <name>` sets the session that gets the user's plain-text phone messages; `--clear` unsets it. The user can also do this from the phone with `/use <name>` (`/use` alone shows buttons to pick one, `/use off` clears); both set the same default, and the last one set wins.
 - `colony telegram reply <id> "<text>"` sends an answer to the Telegram chat. colony adds a 🤖 NAME header itself, don't add your own.
 
 ## Receiving a `[COLONY MSG]` block
@@ -67,6 +67,7 @@ Instruction: ... colony telegram reply k3f9qa "<answer>"
 - ALWAYS answer with `colony telegram reply <id> "<short answer>"`. An answer in the terminal never reaches the phone.
 - Keep it short: a few lines, result first (see Phone replies).
 - The reply id is valid for 24 hours.
+- The user may swipe-reply in Telegram to your answer; that message then comes back to you with a new reply id, even when you are not the default session. So keep answering with `colony telegram reply`, never in the terminal.
 
 ### Phone replies
 

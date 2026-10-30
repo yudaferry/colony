@@ -17,6 +17,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 mod tests {
     #[test]
     fn version_is_set() {
-        assert_eq!(crate::VERSION, "1.2.0");
+        assert_eq!(crate::VERSION, "1.3.0");
     }
 }

@@ -10,6 +10,8 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 const API_BASE: &str = "https://api.telegram.org";
+/// Update kinds the bot asks for.
+pub const ALLOWED_UPDATES: [&str; 2] = ["message", "callback_query"];
 const SHORT_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -23,6 +25,32 @@ pub struct Update {
     pub update_id: i64,
     #[serde(default)]
     pub message: Option<Message>,
+    #[serde(default)]
+    pub callback_query: Option<CallbackQuery>,
+}
+
+/// A tap on an inline button.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct CallbackQuery {
+    pub id: String,
+    pub from: User,
+    /// The bot's message the button sits on.
+    #[serde(default)]
+    pub message: Option<Message>,
+    #[serde(default)]
+    pub data: Option<String>,
+}
+
+/// The message a swipe-reply points at (only its id is used).
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ReplyRef {
+    pub message_id: i64,
+}
+
+/// Answer of `sendMessage`: only the new message's id.
+#[derive(Deserialize, Debug)]
+struct Sent {
+    message_id: i64,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -36,6 +64,9 @@ pub struct Message {
     pub date: i64,
     #[serde(default)]
     pub text: Option<String>,
+    /// Set when the user swipe-replied to another message.
+    #[serde(default)]
+    pub reply_to_message: Option<ReplyRef>,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -53,10 +84,23 @@ pub struct Chat {
 pub trait TelegramApi {
     fn get_me(&self) -> Result<BotInfo>;
     fn get_updates(&self, offset: i64, timeout_secs: u64) -> Result<Vec<Update>>;
-    fn send_message(&self, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<()>;
+    /// Returns the `message_id` of the sent message.
+    fn send_message(&self, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<i64>;
     /// Sends `html` with `parse_mode` HTML. Default: plain send (for wrappers).
-    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<()> {
+    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<i64> {
         self.send_message(chat_id, html, reply_to)
+    }
+    /// Sends plain `text` with an inline keyboard (`reply_markup`). Default: no keyboard (for wrappers).
+    fn send_keyboard(&self, chat_id: i64, text: &str, reply_to: Option<i64>, _markup: &Value) -> Result<i64> {
+        self.send_message(chat_id, text, reply_to)
+    }
+    /// `answerCallbackQuery` with a short toast. Default: nothing (for wrappers).
+    fn answer_callback(&self, _callback_id: &str, _text: &str) -> Result<()> {
+        Ok(())
+    }
+    /// `editMessageText` (plain) with a new inline keyboard. Default: nothing (for wrappers).
+    fn edit_message(&self, _chat_id: i64, _message_id: i64, _text: &str, _markup: &Value) -> Result<()> {
+        Ok(())
     }
     /// Registers the `/` command menu (`setMyCommands`): `(command, description)` pairs.
     fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<()>;
@@ -82,6 +126,23 @@ pub fn send_message_body(chat_id: i64, text: &str, reply_to: Option<i64>) -> Val
         });
     }
     body
+}
+
+/// `sendMessage` body with an inline keyboard.
+pub fn send_keyboard_body(chat_id: i64, text: &str, reply_to: Option<i64>, markup: &Value) -> Value {
+    let mut body = send_message_body(chat_id, text, reply_to);
+    body["reply_markup"] = markup.clone();
+    body
+}
+
+/// `answerCallbackQuery` body.
+pub fn answer_callback_body(callback_id: &str, text: &str) -> Value {
+    json!({ "callback_query_id": callback_id, "text": text })
+}
+
+/// `editMessageText` body (plain text) with a new inline keyboard.
+pub fn edit_message_body(chat_id: i64, message_id: i64, text: &str, markup: &Value) -> Value {
+    json!({ "chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": markup })
 }
 
 /// `sendMessage` body with `parse_mode` HTML.
@@ -173,23 +234,46 @@ impl TelegramApi for HttpTelegram {
         let body = json!({
             "offset": offset,
             "timeout": timeout_secs,
-            "allowed_updates": ["message"],
+            "allowed_updates": ALLOWED_UPDATES,
         });
         // HTTP timeout = long-poll timeout + 10 s.
         self.call("getUpdates", &body, Duration::from_secs(timeout_secs + 10))
     }
 
-    fn send_message(&self, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<()> {
-        let _: Value = self.call(
+    fn send_message(&self, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<i64> {
+        let s: Sent = self.call(
             "sendMessage",
             &send_message_body(chat_id, text, reply_to),
             SHORT_TIMEOUT,
         )?;
+        Ok(s.message_id)
+    }
+
+    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<i64> {
+        let s: Sent = self.call("sendMessage", &send_html_body(chat_id, html, reply_to), SHORT_TIMEOUT)?;
+        Ok(s.message_id)
+    }
+
+    fn send_keyboard(&self, chat_id: i64, text: &str, reply_to: Option<i64>, markup: &Value) -> Result<i64> {
+        let s: Sent = self.call(
+            "sendMessage",
+            &send_keyboard_body(chat_id, text, reply_to, markup),
+            SHORT_TIMEOUT,
+        )?;
+        Ok(s.message_id)
+    }
+
+    fn answer_callback(&self, callback_id: &str, text: &str) -> Result<()> {
+        let _: Value = self.call("answerCallbackQuery", &answer_callback_body(callback_id, text), SHORT_TIMEOUT)?;
         Ok(())
     }
 
-    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<()> {
-        let _: Value = self.call("sendMessage", &send_html_body(chat_id, html, reply_to), SHORT_TIMEOUT)?;
+    fn edit_message(&self, chat_id: i64, message_id: i64, text: &str, markup: &Value) -> Result<()> {
+        let _: Value = self.call(
+            "editMessageText",
+            &edit_message_body(chat_id, message_id, text, markup),
+            SHORT_TIMEOUT,
+        )?;
         Ok(())
     }
 
@@ -209,10 +293,19 @@ impl TelegramApi for FailingTelegram {
     fn get_updates(&self, _offset: i64, _timeout_secs: u64) -> Result<Vec<Update>> {
         Err(anyhow!("{}", self.0))
     }
-    fn send_message(&self, _chat_id: i64, _text: &str, _reply_to: Option<i64>) -> Result<()> {
+    fn send_message(&self, _chat_id: i64, _text: &str, _reply_to: Option<i64>) -> Result<i64> {
         Err(anyhow!("{}", self.0))
     }
-    fn send_html(&self, _chat_id: i64, _html: &str, _reply_to: Option<i64>) -> Result<()> {
+    fn send_html(&self, _chat_id: i64, _html: &str, _reply_to: Option<i64>) -> Result<i64> {
+        Err(anyhow!("{}", self.0))
+    }
+    fn send_keyboard(&self, _chat_id: i64, _text: &str, _reply_to: Option<i64>, _markup: &Value) -> Result<i64> {
+        Err(anyhow!("{}", self.0))
+    }
+    fn answer_callback(&self, _callback_id: &str, _text: &str) -> Result<()> {
+        Err(anyhow!("{}", self.0))
+    }
+    fn edit_message(&self, _chat_id: i64, _message_id: i64, _text: &str, _markup: &Value) -> Result<()> {
         Err(anyhow!("{}", self.0))
     }
     fn set_my_commands(&self, _commands: &[(&str, &str)]) -> Result<()> {
@@ -237,6 +330,18 @@ pub struct FakeTelegram {
     /// `(command, description)` pairs per `set_my_commands` call.
     pub commands: RefCell<Vec<Vec<(String, String)>>>,
     pub fail_commands: Cell<bool>,
+    /// Last message id handed out; each send returns the next one.
+    pub next_id: Cell<i64>,
+    /// `(message_id, chat_id, text)` per `send_message`/`send_html`/`send_keyboard`.
+    pub ids: RefCell<Vec<(i64, i64, String)>>,
+    /// `(chat_id, text, markup)` per `send_keyboard` call (also in `sent`).
+    pub keyboards: RefCell<Vec<(i64, String, Value)>>,
+    /// `(callback_id, text)` per `answer_callback` call.
+    pub answers: RefCell<Vec<(String, String)>>,
+    /// `(chat_id, message_id, text, markup)` per `edit_message` call.
+    pub edits: RefCell<Vec<(i64, i64, String, Value)>>,
+    /// `allowed_updates` the poller asked for is fixed; the fake just counts polls.
+    pub polls: Cell<usize>,
 }
 
 impl FakeTelegram {
@@ -255,6 +360,12 @@ impl FakeTelegram {
             offsets: RefCell::new(Vec::new()),
             commands: RefCell::new(Vec::new()),
             fail_commands: Cell::new(false),
+            next_id: Cell::new(1000),
+            ids: RefCell::new(Vec::new()),
+            keyboards: RefCell::new(Vec::new()),
+            answers: RefCell::new(Vec::new()),
+            edits: RefCell::new(Vec::new()),
+            polls: Cell::new(0),
         }
     }
 
@@ -283,28 +394,48 @@ impl TelegramApi for FakeTelegram {
 
     fn get_updates(&self, offset: i64, _timeout_secs: u64) -> Result<Vec<Update>> {
         self.offsets.borrow_mut().push(offset);
+        self.polls.set(self.polls.get() + 1);
         if self.fail_updates.get() {
             return Err(anyhow!("fake getUpdates failure"));
         }
         Ok(self.updates.borrow_mut().pop_front().unwrap_or_default())
     }
 
-    fn send_message(&self, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<()> {
+    fn send_message(&self, chat_id: i64, text: &str, reply_to: Option<i64>) -> Result<i64> {
         if self.fail_send.get() {
             return Err(anyhow!("fake sendMessage failure"));
         }
         self.sent
             .borrow_mut()
             .push((chat_id, text.to_string(), reply_to));
-        Ok(())
+        let id = self.next_id.get() + 1;
+        self.next_id.set(id);
+        self.ids.borrow_mut().push((id, chat_id, text.to_string()));
+        Ok(id)
     }
 
-    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<()> {
+    fn send_html(&self, chat_id: i64, html: &str, reply_to: Option<i64>) -> Result<i64> {
         if self.reject_html.get() {
             return Err(anyhow!("Telegram API error: Bad Request: can't parse entities"));
         }
-        self.send_message(chat_id, html, reply_to)?;
+        let id = self.send_message(chat_id, html, reply_to)?;
         self.html_sent.borrow_mut().push((chat_id, html.to_string(), reply_to));
+        Ok(id)
+    }
+
+    fn send_keyboard(&self, chat_id: i64, text: &str, reply_to: Option<i64>, markup: &Value) -> Result<i64> {
+        let id = self.send_message(chat_id, text, reply_to)?;
+        self.keyboards.borrow_mut().push((chat_id, text.to_string(), markup.clone()));
+        Ok(id)
+    }
+
+    fn answer_callback(&self, callback_id: &str, text: &str) -> Result<()> {
+        self.answers.borrow_mut().push((callback_id.to_string(), text.to_string()));
+        Ok(())
+    }
+
+    fn edit_message(&self, chat_id: i64, message_id: i64, text: &str, markup: &Value) -> Result<()> {
+        self.edits.borrow_mut().push((chat_id, message_id, text.to_string(), markup.clone()));
         Ok(())
     }
 
@@ -353,6 +484,35 @@ mod tests {
             b,
             json!({"commands":[{"command":"list","description":"List"},{"command":"use","description":"Use"}]})
         );
+    }
+
+    #[test]
+    fn allowed_updates_include_callback_query() {
+        assert_eq!(ALLOWED_UPDATES, ["message", "callback_query"]);
+    }
+
+    #[test]
+    fn keyboard_edit_answer_bodies() {
+        let kb = json!({"inline_keyboard":[[{"text":"a","callback_data":"use:x"}]]});
+        let b = send_keyboard_body(1, "t", Some(2), &kb);
+        assert_eq!(b["reply_markup"], kb);
+        assert_eq!(b["reply_parameters"]["message_id"], 2);
+        let e = edit_message_body(1, 9, "t", &kb);
+        assert_eq!(e["message_id"], 9);
+        assert_eq!(e["reply_markup"], kb);
+        assert_eq!(answer_callback_body("cb", "hi"), json!({"callback_query_id":"cb","text":"hi"}));
+    }
+
+    #[test]
+    fn callback_and_reply_to_parse() {
+        let cq = r#"{"update_id":7,"callback_query":{"id":"abc","from":{"id":42,"is_bot":false},"message":{"message_id":5,"chat":{"id":42,"type":"private"},"date":1},"chat_instance":"x","data":"use:w1:p2"}}"#;
+        let u: Update = serde_json::from_str(cq).unwrap();
+        let c = u.callback_query.unwrap();
+        assert_eq!((c.id.as_str(), c.from.id, c.data.as_deref()), ("abc", 42, Some("use:w1:p2")));
+        assert_eq!(c.message.unwrap().message_id, 5);
+        let m = r#"{"update_id":8,"message":{"message_id":6,"from":{"id":42},"chat":{"id":42,"type":"private"},"date":2,"text":"x","reply_to_message":{"message_id":77,"chat":{"id":42,"type":"private"},"date":1}}}"#;
+        let u: Update = serde_json::from_str(m).unwrap();
+        assert_eq!(u.message.unwrap().reply_to_message.unwrap().message_id, 77);
     }
 
     #[test]

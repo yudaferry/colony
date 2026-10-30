@@ -10,6 +10,7 @@ use crate::ctx::Ctx;
 use crate::state::log::LogEvent;
 use crate::state::names::{Entry, Kind, NAMES_FILE, Names};
 use crate::state::pending::{PENDING_FILE, Pending};
+use crate::state::sent::{SENT_FILE, SENT_MODE, Sent};
 use crate::state::telegram::{TELEGRAM_FILE, TELEGRAM_MODE, TelegramConfig};
 use crate::telegram::reply_id::PENDING_MODE;
 use anyhow::{Result, anyhow, bail};
@@ -36,8 +37,22 @@ pub fn reply(ctx: &Ctx, api: &dyn TelegramApi, reply_id: &str, text: &str) -> Re
         bail!("reply id {reply_id} unknown or expired (valid 24 h)");
     };
     let names: Names = ctx.state.read_json(NAMES_FILE)?;
-    let sender = sender_name(ctx, &names, &entry.target);
-    send_markdown(api, entry.chat_id, text, Some(entry.message_id), Some(&sender))?;
+    let (sender, target) = sender_name(ctx, &names, &entry.target);
+    let ids = send_markdown(api, entry.chat_id, text, Some(entry.message_id), Some(&sender))?;
+    // Remember who sent these messages, so a swipe-reply goes back to that session.
+    // The messages are out already: a failed record is reported, not fatal.
+    let chat_id = entry.chat_id;
+    let recorded = if target.is_empty() {
+        Ok(())
+    } else {
+        ctx.state.update_json(SENT_FILE, SENT_MODE, |s: &mut Sent| {
+            s.record(ctx.clock.now(), chat_id, &ids, &target);
+            Ok(())
+        })
+    };
+    if let Err(e) = recorded {
+        eprintln!("colony telegram: could not record the sent message: {e:#}");
+    }
     log(
         ctx,
         &LogEvent::Reply {
@@ -50,28 +65,28 @@ pub fn reply(ctx: &Ctx, api: &dyn TelegramApi, reply_id: &str, text: &str) -> Re
 
 /// Name for the reply header: the calling pane's registered name, else its discovered
 /// display name, else its pane id. When the pane is unknown: the pending target, else "colony".
-fn sender_name(ctx: &Ctx, names: &Names, target: &str) -> String {
+/// Returns `(header name, resolvable target)`; the target is the registered name, the
+/// discovered name when it is unique, else the pane id.
+fn sender_name(ctx: &Ctx, names: &Names, target: &str) -> (String, String) {
     let fallback = if target.trim().is_empty() { "colony" } else { target };
+    let fb = || (fallback.to_string(), target.trim().to_string());
     let Ok(kind) = detect_env(ctx.env) else {
-        return fallback.to_string();
+        return fb();
     };
     let backend = ctx.backends.get(kind);
     let Ok(pane) = backend.current_pane() else {
-        return fallback.to_string();
+        return fb();
     };
     if let Some(n) = names.name_of_pane(kind, &pane) {
-        return n.to_string();
+        return (n.to_string(), n.to_string());
     }
-    backend
-        .list_panes()
-        .ok()
-        .and_then(|ps| {
-            discover(ctx, kind, &ps, names)
-                .into_iter()
-                .find(|d| d.pane_id == pane)
-                .map(|d| d.name)
-        })
-        .unwrap_or(pane)
+    let found = backend.list_panes().ok().and_then(|ps| {
+        let all = discover(ctx, kind, &ps, names);
+        let d = all.iter().find(|d| d.pane_id == pane)?;
+        let unique = all.iter().filter(|o| o.name == d.name).count() == 1;
+        Some((d.name.clone(), if unique { d.name.clone() } else { d.pane_id.clone() }))
+    });
+    found.unwrap_or_else(|| (pane.clone(), pane))
 }
 
 /// Bot id is the part of the token before `:`.
@@ -262,6 +277,10 @@ pub fn disconnect(ctx: &Ctx) -> Result<String> {
             *p = Pending::default();
             Ok(())
         })?;
+    ctx.state.update_json(SENT_FILE, SENT_MODE, |s: &mut Sent| {
+        *s = Sent::default();
+        Ok(())
+    })?;
     out.push_str("Disconnected: token, lock, receiver and pending replies cleared.");
     Ok(out)
 }
@@ -406,7 +425,7 @@ mod tests {
         let api = FakeTelegram::new();
         reply(&h.ctx(), &api, "k3f9qa", "hi").unwrap();
         assert_eq!(api.sent.borrow()[0].1, format!("{}hi", hdr_html("BO")));
-        assert_eq!(sender_name(&h.ctx(), &h.names(), ""), "colony");
+        assert_eq!(sender_name(&h.ctx(), &h.names(), ""), ("colony".to_string(), String::new()));
     }
 
     #[test]
@@ -466,6 +485,46 @@ mod tests {
         let api = FakeTelegram::new();
         reply(&h.ctx(), &api, "k3f9qa", "done").unwrap();
         assert_eq!(*api.sent.borrow(), vec![(42, format!("{}done", hdr_html("W1:P1")), Some(7))]);
+    }
+
+    #[test]
+    fn reply_records_every_chunk_in_sent_json_mode_600() {
+        let h = Harness::herdr();
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(5));
+        h.add_name("bo-server", BackendKind::Herdr, "w1:p1", Kind::Claude);
+        let api = FakeTelegram::new();
+        reply(&h.ctx(), &api, "k3f9qa", &"a".repeat(10_000)).unwrap();
+        let ids: Vec<i64> = api.ids.borrow().iter().map(|(id, _, _)| *id).collect();
+        assert!(ids.len() >= 3, "{ids:?}");
+        let sent: Sent = h.state.read_json(SENT_FILE).unwrap();
+        assert_eq!(sent.0.len(), ids.len());
+        for id in ids {
+            assert_eq!(sent.target_of(42, id, h.clock.0), Some("bo-server"));
+        }
+        assert_eq!(mode(&h, SENT_FILE), 0o600);
+    }
+
+    #[test]
+    fn reply_records_pane_id_target_and_prunes_old_entries() {
+        let h = Harness::herdr();
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(5));
+        h.state
+            .update_json(SENT_FILE, SENT_MODE, |s: &mut Sent| {
+                s.record(h.clock.0 - Duration::days(8), 42, &[1], "old");
+                s.record(h.clock.0 - Duration::days(6), 42, &[2], "recent");
+                Ok(())
+            })
+            .unwrap();
+        let api = FakeTelegram::new();
+        reply(&h.ctx(), &api, "k3f9qa", "hi").unwrap();
+        let sent: Sent = h.state.read_json(SENT_FILE).unwrap();
+        assert!(!sent.0.contains_key("42:1"));
+        assert!(sent.0.contains_key("42:2"));
+        // Header said W1:P1 (unregistered pane): the stored target is the pane id.
+        let id = api.ids.borrow()[0].0;
+        assert_eq!(sent.target_of(42, id, h.clock.0), Some("w1:p1"));
     }
 
     #[test]
@@ -589,7 +648,7 @@ mod tests {
             fn get_updates(&self, o: i64, t: u64) -> Result<Vec<super::super::api::Update>> {
                 self.0.get_updates(o, t)
             }
-            fn send_message(&self, c: i64, t: &str, r: Option<i64>) -> Result<()> {
+            fn send_message(&self, c: i64, t: &str, r: Option<i64>) -> Result<i64> {
                 self.0.send_message(c, t, r)
             }
             fn set_my_commands(&self, c: &[(&str, &str)]) -> Result<()> {

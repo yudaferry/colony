@@ -14,7 +14,7 @@ The bot lets one person list sessions, message them and read their output from a
 
 The running loop records its PID and start time in `telegram.json` and clears them on a clean exit. `connect` refuses to start a second bot when a live bot process for the same token exists, and says where it runs. If the token is new while a bot is alive, that bot switches to the new token and no second one is started.
 
-`colony telegram disconnect` clears the token, lock, receiver and all pending reply IDs; the bot loop exits when the token is gone. It closes the `telegram-bot` pane only if colony created it with `--new-pane`, never a pane it did not create. `colony telegram status` shows whether it is connected, the bot name, the locked user id, the receiver and `bot process: running (pid N[, pane P])`. The process counts as running only if its PID is alive and (where `/proc` exists) its command line is a colony process; otherwise `not running`.
+`colony telegram disconnect` clears the token, lock, receiver, all pending reply IDs and the recorded sent messages; the bot loop exits when the token is gone. It closes the `telegram-bot` pane only if colony created it with `--new-pane`, never a pane it did not create. `colony telegram status` shows whether it is connected, the bot name, the locked user id, the receiver and `bot process: running (pid N[, pane P])`. The process counts as running only if its PID is alive and (where `/proc` exists) its command line is a colony process; otherwise `not running`.
 
 ## Polling
 
@@ -42,12 +42,13 @@ Telegram command names allow only `a-z 0-9 _`, so the list command is `/list`.
 |---|---|
 | `/list` | one line per session: name, kind, status, backend and pane; unregistered Claude sessions are included, kind `claude*`, with a `* not registered` line |
 | `/use <name>` | set the default session for plain text; `<name>` resolves like `/send` (registered name, pane id or discovered name); unknown or ambiguous: error reply, nothing changed |
-| `/use` | show the current default session |
+| `/use` | reply "🎯 Choose default session:" with inline buttons (see Inline buttons) |
 | `/use off` | clear the default session |
 | `/send <name> <message>` | `<name>` is a registered or discovered name or a pane id; forward with a Telegram envelope; the bot answers "📨 sent to <name>" (see Busy and blocked sessions) |
 | `/last <name> [lines]` | recent output (default 50, at most 1000 lines), trimmed to the last lines that fit one message |
 | `/help` (or anything unknown) | list the commands |
 | plain text | forward to the default session (`/use`) |
+| swipe-reply to a session's answer | forward to the session that sent that answer, default unchanged (see Reply-to routing) |
 
 Plain text with no default session gets "❓ no session selected, use /use <name> or /send <name> <msg>". If the default session's pane is gone, "⚠️ receiver <name> not found, use /send". A name that is not a live session gets "⚠️ no session named <name>". `/use <name>` answers "🎯 default session: <name>" and `/use off` "🎯 default session cleared".
 
@@ -64,6 +65,18 @@ Every reply starts with a sender header, added by colony (sessions must not add 
 ✅ Build passed
 • 142 tests green
 ```
+
+## Inline buttons
+
+`/use` with no argument sends "🎯 Choose default session:" with one inline button per session (registered and discovered, as in `/list`). A button is the status dot plus the name (🟢 idle, 🟡 working, 🔴 blocked, ⚪ unknown); the current default has "✅ " in front; the last button is "🚫 off". `/use <name>` typed by hand keeps working.
+
+Tapping a button sends a `callback_query` (the bot asks `getUpdates` for `allowed_updates` `["message","callback_query"]`). It follows the lock rules of messages: only the locked user, only in the private chat, everyone else ignored silently, and a tap never claims the lock. The bot sets or clears the default exactly like `/use <name>` / `/use off`, answers the tap with a short toast ("🎯 bo-server-84", "🎯 default cleared") and edits the message so the ✅ moves. `callback_data` is `use:<pane id>` (or `use:#<index>` if the pane id would exceed Telegram's 64 bytes) and is resolved again against the live sessions on a tap; if the session is gone the toast is "⚠️ session gone" and the buttons are refreshed.
+
+## Reply-to routing
+
+Every message `colony telegram reply` sends (all chunks) is recorded in `~/.colony/sent.json` (mode 600, atomic locked writes) as `<chat id>:<message id>` -> the sender's target (registered name, unique discovered name, else pane id) and time. Entries expire after 7 days and are pruned on every write; `disconnect` clears the file.
+
+When the locked user swipe-replies in Telegram to such a message with plain text, the bot sends it to that session like `/send <name> <text>`: new reply ID, Telegram envelope, busy/blocked notice. The default session is **not** changed. A reply to a message that is not recorded (the bot's own acks, `/list`, an expired entry) is routed normally, to the default session. If the recorded session is gone the answer is "⚠️ no session named <name>" and nothing is sent. A reply that starts with `/` is a command as usual.
 
 ## Command menu
 
@@ -89,7 +102,7 @@ Only messages that carry a reply ID are ever sent to Telegram, and nothing is se
 ## Security notes
 
 - One locked user; the lock is saved in a mode-600 file.
-- `telegram.json` and `pending.json` are mode 600 (they hold the token and chat ids); `~/.colony` is mode 700.
+- `telegram.json` and `pending.json` and `sent.json` are mode 600 (they hold the token, chat ids and message ids); `~/.colony` is mode 700.
 - The bot token is visible in `ps` and shell history while `colony telegram connect` runs.
 - A session that knows a valid reply ID can post to the chat; IDs are random, short-lived and only sent to the session that should answer.
 - A crashed bot is shown as `not running` once its PID is gone; a stale PID that was reused by a non-colony process is ignored.

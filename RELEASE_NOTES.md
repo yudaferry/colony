@@ -1,5 +1,26 @@
 # Release Notes
 
+## colony 1.3.0 — 2026-10-30 (WIB, UTC+7)
+
+### New
+
+- **`/use` buttons.** `/use` with no argument now replies "🎯 Choose default session:" with one inline button per session (🟢 idle, 🟡 working, 🔴 blocked, ⚪ unknown, then the name), a "✅ " on the current default and a "🚫 off" button. Tap one to set (or clear) the default; the bot answers with a short toast and moves the ✅. Only the locked user in the private chat can tap; a session that vanished gives "⚠️ session gone" and refreshed buttons. `/use <name>` and `/use off` still work. The bot now asks Telegram for `callback_query` updates too.
+- **Swipe-reply routing.** Swipe-reply in Telegram to a session's answer (the `🤖 NAME` message) and your text goes to that same session, like `/send <name> <text>`, without changing the default. `colony telegram reply` records the id of every message it sends in `~/.colony/sent.json` (mode 600, kept 7 days). A reply to anything else (acks, `/list`, old messages) goes to the default session as before.
+
+### Changed
+
+- `/use` with no argument no longer prints the current default as text; the ✅ in the buttons shows it.
+- `colony telegram disconnect` also clears `sent.json`.
+
+### Download
+
+Download `colony-1.3.0-x86_64-linux.tar.gz` (static Linux x86_64 build, with a `.sha256` file), then:
+
+```bash
+tar xzf colony-1.3.0-x86_64-linux.tar.gz
+./colony --help
+```
+
 ## colony 1.2.0 — 2026-10-30 (WIB, UTC+7)
 
 ### New

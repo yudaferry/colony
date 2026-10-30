@@ -29,7 +29,7 @@
 
       packages.${system}.default = rustPlatform.buildRustPackage {
         pname = "colony";
-        version = "1.2.0";
+        version = "1.3.0";
         src = ./.;
         cargoLock.lockFile = ./Cargo.lock;
         # reqwest's `rustls` feature uses the aws-lc-rs crypto provider, whose
