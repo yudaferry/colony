@@ -1,12 +1,12 @@
 use anyhow::{Result, bail};
 use clap::{CommandFactory, Parser};
 use colony::backend::RealBackends;
-use colony::cli::{Cli, Cmd, TgCmd};
-use colony::commands::{close, list, read, register, send, spawn, wait};
+use colony::cli::{Cli, Cmd, SchedCmd, TgCmd};
+use colony::commands::{close, list, read, register, schedule, send, spawn, wait};
 use colony::ctx::{Ctx, ProcessEnv, SystemClock};
 use colony::state::store::StateDir;
 use colony::state::telegram::{TELEGRAM_FILE, TelegramConfig};
-use colony::telegram::api::{FailingTelegram, HttpTelegram, TelegramApi};
+use colony::telegram::api::{FailingTelegram, FileKind, HttpTelegram, TelegramApi};
 use colony::telegram::{bot, cmds};
 use std::time::Duration;
 
@@ -78,6 +78,20 @@ fn run(cli: Cli) -> Result<String> {
         } => wait::wait(&ctx, &target, until, Duration::from_secs(timeout)),
         Cmd::Close { target } => close::close(&ctx, &target),
         Cmd::Telegram { cmd } => telegram(&ctx, cmd),
+        Cmd::Schedule { cmd } => match cmd {
+            SchedCmd::List => schedule::list(&ctx),
+            SchedCmd::AddMessage { id, cron, tz, limits, target, message } => {
+                schedule::add_message(&ctx, &id, &cron, &tz, &limits, &target, &message)
+            }
+            SchedCmd::AddCommand { id, cron, tz, notify, limits, command } => {
+                schedule::add_command(&ctx, &id, &cron, &tz, notify.as_deref(), &limits, &command)
+            }
+            SchedCmd::Rm { id } => schedule::rm(&ctx, &id),
+            SchedCmd::Pause { id, when, tz } => schedule::pause(&ctx, &id, &when, &tz),
+            SchedCmd::Resume { id } => schedule::resume(&ctx, &id),
+            SchedCmd::Enable { id } => schedule::enable(&ctx, &id, true),
+            SchedCmd::Disable { id } => schedule::enable(&ctx, &id, false),
+        },
     }
 }
 
@@ -111,11 +125,16 @@ fn telegram(ctx: &Ctx, cmd: TgCmd) -> Result<String> {
         }
         TgCmd::Disconnect => cmds::disconnect(ctx),
         TgCmd::Status => cmds::status(ctx, &http_api),
-        TgCmd::Receiver { name, clear } => cmds::receiver(ctx, name.as_deref(), clear),
-        TgCmd::Reply { reply_id, text } => {
+        TgCmd::Receiver { name, clear } => cmds::receiver_pinned(ctx, &http_api, name.as_deref(), clear),
+        TgCmd::Reply { reply_id, text, photo, file } => {
+            let attach = match (photo, file) {
+                (Some(path), _) => Some(cmds::Attachment { kind: FileKind::Photo, path }),
+                (None, Some(path)) => Some(cmds::Attachment { kind: FileKind::Document, path }),
+                (None, None) => None,
+            };
             // Straight to the Bot API from the saved token: no bot process, no receiver.
             let api = http_api(&saved_token(ctx)?);
-            cmds::reply(ctx, api.as_ref(), &reply_id, &text)
+            cmds::reply_with(ctx, api.as_ref(), &reply_id, text.as_deref(), attach.as_ref())
         }
         TgCmd::Run => {
             saved_token(ctx)?;

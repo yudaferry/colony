@@ -4,3 +4,4 @@ pub mod pending;
 pub mod store;
 pub mod telegram;
 pub mod sent;
+pub mod schedule;

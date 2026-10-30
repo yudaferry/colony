@@ -29,6 +29,11 @@ fn random_id() -> String {
     id
 }
 
+/// A fresh 6-char `[a-z0-9]` id (inbox file names).
+pub fn short_id() -> String {
+    random_id()
+}
+
 /// A 6-char ID that is not already in `existing`.
 pub fn new_reply_id(existing: &Pending) -> String {
     loop {

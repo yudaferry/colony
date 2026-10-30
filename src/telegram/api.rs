@@ -7,12 +7,114 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const API_BASE: &str = "https://api.telegram.org";
 /// Update kinds the bot asks for.
 pub const ALLOWED_UPDATES: [&str; 2] = ["message", "callback_query"];
 const SHORT_TIMEOUT: Duration = Duration::from_secs(20);
+/// Uploads take longer than a JSON call.
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+/// Telegram's caption limit (UTF-16 units).
+pub const CAPTION_LIMIT: usize = 1024;
+/// Largest photo / document the Bot API takes.
+pub const MAX_PHOTO_BYTES: u64 = 10 * 1024 * 1024;
+pub const MAX_DOCUMENT_BYTES: u64 = 50 * 1024 * 1024;
+/// Largest file the Bot API lets a bot download (`getFile`).
+pub const MAX_DOWNLOAD_BYTES: u64 = 20 * 1024 * 1024;
+
+/// How a file goes out: `sendPhoto` (inline image) or `sendDocument` (any file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileKind {
+    Photo,
+    Document,
+}
+
+impl FileKind {
+    pub fn method(self) -> &'static str {
+        match self {
+            FileKind::Photo => "sendPhoto",
+            FileKind::Document => "sendDocument",
+        }
+    }
+    pub fn field(self) -> &'static str {
+        match self {
+            FileKind::Photo => "photo",
+            FileKind::Document => "document",
+        }
+    }
+    pub fn max_bytes(self) -> u64 {
+        match self {
+            FileKind::Photo => MAX_PHOTO_BYTES,
+            FileKind::Document => MAX_DOCUMENT_BYTES,
+        }
+    }
+}
+
+/// Content-Type from the file extension; unknown ones are `application/octet-stream`.
+pub fn guess_content_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("png") => "image/png",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Builds a multipart/form-data body by hand: text `fields`, then one file part.
+/// (reqwest's `multipart` feature is not enabled and may not be added.)
+pub fn multipart_body(
+    boundary: &str,
+    fields: &[(&str, &str)],
+    file_field: &str,
+    filename: &str,
+    content_type: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let clean = |s: &str| s.replace(['"', '\r', '\n', '\\'], "_");
+    let mut out = Vec::with_capacity(data.len() + 512);
+    for (name, value) in fields {
+        out.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"\r\n\r\n{value}\r\n",
+                clean(name)
+            )
+            .as_bytes(),
+        );
+    }
+    out.extend_from_slice(
+        format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {content_type}\r\n\r\n",
+            clean(file_field),
+            clean(filename)
+        )
+        .as_bytes(),
+    );
+    out.extend_from_slice(data);
+    out.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+    out
+}
+
+/// A boundary that does not occur in `data`.
+fn pick_boundary(data: &[u8]) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+    for n in 0u32..32 {
+        let b = format!("----colony{:x}{:x}{n}", nanos, std::process::id());
+        let needle = b.as_bytes();
+        if !data.windows(needle.len()).any(|w| w == needle) {
+            return b;
+        }
+    }
+    "----colony-boundary-fallback-7f3a9c".to_string()
+}
 
 #[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct BotInfo {
@@ -47,13 +149,34 @@ pub struct ReplyRef {
     pub message_id: i64,
 }
 
+/// A file attached to a message (photo size, document, video, audio or voice note).
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileRef {
+    pub file_id: String,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+    #[serde(default)]
+    pub mime_type: Option<String>,
+    #[serde(default)]
+    pub file_name: Option<String>,
+}
+
+/// Answer of `getFile`.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileInfo {
+    #[serde(default)]
+    pub file_path: Option<String>,
+    #[serde(default)]
+    pub file_size: Option<u64>,
+}
+
 /// Answer of `sendMessage`: only the new message's id.
 #[derive(Deserialize, Debug)]
 struct Sent {
     message_id: i64,
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Message {
     pub message_id: i64,
     #[serde(default)]
@@ -67,14 +190,42 @@ pub struct Message {
     /// Set when the user swipe-replied to another message.
     #[serde(default)]
     pub reply_to_message: Option<ReplyRef>,
+    /// Caption of a photo / document / video message.
+    #[serde(default)]
+    pub caption: Option<String>,
+    /// Photo sizes, smallest first.
+    #[serde(default)]
+    pub photo: Vec<FileRef>,
+    #[serde(default)]
+    pub document: Option<FileRef>,
+    #[serde(default)]
+    pub video: Option<FileRef>,
+    #[serde(default)]
+    pub audio: Option<FileRef>,
+    #[serde(default)]
+    pub voice: Option<FileRef>,
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+impl Message {
+    /// The attached file to download: the largest photo, else document, video, audio or voice.
+    /// The flag tells a photo (default extension jpg).
+    pub fn attachment(&self) -> Option<(&FileRef, bool)> {
+        if let Some(p) = self.photo.iter().max_by_key(|p| p.file_size.unwrap_or(0)).or(self.photo.last()) {
+            return Some((p, true));
+        }
+        [&self.document, &self.video, &self.audio, &self.voice]
+            .into_iter()
+            .find_map(|f| f.as_ref())
+            .map(|f| (f, false))
+    }
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct User {
     pub id: i64,
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq, Default)]
 pub struct Chat {
     pub id: i64,
     #[serde(rename = "type")]
@@ -101,6 +252,44 @@ pub trait TelegramApi {
     /// `editMessageText` (plain) with a new inline keyboard. Default: nothing (for wrappers).
     fn edit_message(&self, _chat_id: i64, _message_id: i64, _text: &str, _markup: &Value) -> Result<()> {
         Ok(())
+    }
+    /// `editMessageText` (plain) with no reply markup, which also removes any keyboard. Default: nothing.
+    fn edit_text(&self, _chat_id: i64, _message_id: i64, _text: &str) -> Result<()> {
+        Ok(())
+    }
+    /// `pinChatMessage` without a notification. Default: nothing (for wrappers).
+    fn pin_message(&self, _chat_id: i64, _message_id: i64) -> Result<()> {
+        Ok(())
+    }
+    /// `unpinChatMessage` for one message. Default: nothing (for wrappers).
+    fn unpin_message(&self, _chat_id: i64, _message_id: i64) -> Result<()> {
+        Ok(())
+    }
+    /// `deleteMessage`. Default: nothing (for wrappers).
+    fn delete_message(&self, _chat_id: i64, _message_id: i64) -> Result<()> {
+        Ok(())
+    }
+    /// `sendPhoto` / `sendDocument` (multipart upload of the file at `path`). `caption` may be empty;
+    /// `html` sets `parse_mode` HTML. Returns the new message id. Default: unsupported (for wrappers).
+    fn send_file(
+        &self,
+        _chat_id: i64,
+        _kind: FileKind,
+        _path: &Path,
+        _caption: &str,
+        _html: bool,
+        _reply_to: Option<i64>,
+    ) -> Result<i64> {
+        Err(anyhow!("sending files is not supported by this client"))
+    }
+    /// `getFile`: where a file can be downloaded from. Default: unsupported (for wrappers).
+    fn get_file(&self, _file_id: &str) -> Result<FileInfo> {
+        Err(anyhow!("downloading files is not supported by this client"))
+    }
+    /// Downloads the file at `file_path` (from `get_file`) into `dest` (new file, mode 600), at most
+    /// `max_bytes`. The download URL contains the token and is never logged. Default: unsupported.
+    fn download_file(&self, _file_path: &str, _dest: &Path, _max_bytes: u64) -> Result<()> {
+        Err(anyhow!("downloading files is not supported by this client"))
     }
     /// Registers the `/` command menu (`setMyCommands`): `(command, description)` pairs.
     fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<()>;
@@ -143,6 +332,21 @@ pub fn answer_callback_body(callback_id: &str, text: &str) -> Value {
 /// `editMessageText` body (plain text) with a new inline keyboard.
 pub fn edit_message_body(chat_id: i64, message_id: i64, text: &str, markup: &Value) -> Value {
     json!({ "chat_id": chat_id, "message_id": message_id, "text": text, "reply_markup": markup })
+}
+
+/// `editMessageText` body (plain text) without reply markup.
+pub fn edit_text_body(chat_id: i64, message_id: i64, text: &str) -> Value {
+    json!({ "chat_id": chat_id, "message_id": message_id, "text": text })
+}
+
+/// `pinChatMessage` body: pins silently.
+pub fn pin_message_body(chat_id: i64, message_id: i64) -> Value {
+    json!({ "chat_id": chat_id, "message_id": message_id, "disable_notification": true })
+}
+
+/// `unpinChatMessage` and `deleteMessage` body.
+pub fn message_ref_body(chat_id: i64, message_id: i64) -> Value {
+    json!({ "chat_id": chat_id, "message_id": message_id })
 }
 
 /// `sendMessage` body with `parse_mode` HTML.
@@ -197,18 +401,20 @@ impl HttpTelegram {
     }
 
     fn call<T: DeserializeOwned>(&self, method: &str, body: &Value, timeout: Duration) -> Result<T> {
-        let url = format!("{API_BASE}/bot{}/{method}", self.token);
-        let resp = self
-            .client
-            .post(&url)
-            .timeout(timeout)
-            .json(body)
-            .send()
-            .map_err(|e| {
-                // reqwest errors carry the URL (and so the token): strip it.
-                let msg = e.without_url().to_string();
-                anyhow!("{method} request failed: {}", scrub_token(&msg, &self.token))
-            })?;
+        let rb = self.post(method).timeout(timeout).json(body);
+        self.finish(method, rb)
+    }
+
+    fn post(&self, method: &str) -> reqwest::blocking::RequestBuilder {
+        self.client.post(format!("{API_BASE}/bot{}/{method}", self.token))
+    }
+
+    fn finish<T: DeserializeOwned>(&self, method: &str, rb: reqwest::blocking::RequestBuilder) -> Result<T> {
+        let resp = rb.send().map_err(|e| {
+            // reqwest errors carry the URL (and so the token): strip it.
+            let msg = e.without_url().to_string();
+            anyhow!("{method} request failed: {}", scrub_token(&msg, &self.token))
+        })?;
         // Telegram answers errors (401, 400, ...) with a JSON body: parse it whatever the status.
         let status = resp.status();
         let text = resp.text().map_err(|e| {
@@ -277,6 +483,96 @@ impl TelegramApi for HttpTelegram {
         Ok(())
     }
 
+    fn edit_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
+        let _: Value = self.call("editMessageText", &edit_text_body(chat_id, message_id, text), SHORT_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn pin_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let _: Value = self.call("pinChatMessage", &pin_message_body(chat_id, message_id), SHORT_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn unpin_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let _: Value = self.call("unpinChatMessage", &message_ref_body(chat_id, message_id), SHORT_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        let _: Value = self.call("deleteMessage", &message_ref_body(chat_id, message_id), SHORT_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn send_file(
+        &self,
+        chat_id: i64,
+        kind: FileKind,
+        path: &Path,
+        caption: &str,
+        html: bool,
+        reply_to: Option<i64>,
+    ) -> Result<i64> {
+        let data = std::fs::read(path).map_err(|e| anyhow!("could not read {}: {e}", path.display()))?;
+        let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+        let chat = chat_id.to_string();
+        let reply = json!({ "message_id": reply_to, "allow_sending_without_reply": true }).to_string();
+        let mut fields: Vec<(&str, &str)> = vec![("chat_id", &chat)];
+        if !caption.is_empty() {
+            fields.push(("caption", caption));
+            if html {
+                fields.push(("parse_mode", "HTML"));
+            }
+        }
+        if reply_to.is_some() {
+            fields.push(("reply_parameters", &reply));
+        }
+        let boundary = pick_boundary(&data);
+        let body = multipart_body(&boundary, &fields, kind.field(), filename, guess_content_type(path), &data);
+        let rb = self
+            .post(kind.method())
+            .timeout(UPLOAD_TIMEOUT)
+            .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
+            .body(body);
+        let s: Sent = self.finish(kind.method(), rb)?;
+        Ok(s.message_id)
+    }
+
+    fn get_file(&self, file_id: &str) -> Result<FileInfo> {
+        self.call("getFile", &json!({ "file_id": file_id }), SHORT_TIMEOUT)
+    }
+
+    fn download_file(&self, file_path: &str, dest: &Path, max_bytes: u64) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let url = format!("{API_BASE}/file/bot{}/{}", self.token, file_path.trim_start_matches('/'));
+        let scrub = |m: String| scrub_token(&m, &self.token);
+        let resp = self
+            .client
+            .get(url)
+            .timeout(UPLOAD_TIMEOUT)
+            .send()
+            .map_err(|e| anyhow!("file download failed: {}", scrub(e.without_url().to_string())))?;
+        if !resp.status().is_success() {
+            return Err(anyhow!("file download failed (HTTP {})", resp.status().as_u16()));
+        }
+        if resp.content_length().is_some_and(|n| n > max_bytes) {
+            return Err(anyhow!("file too big"));
+        }
+        let bytes = resp
+            .bytes()
+            .map_err(|e| anyhow!("file download failed: {}", scrub(e.without_url().to_string())))?;
+        if bytes.len() as u64 > max_bytes {
+            return Err(anyhow!("file too big"));
+        }
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(dest)
+            .map_err(|e| anyhow!("could not create {}: {e}", dest.display()))?;
+        f.write_all(&bytes).map_err(|e| anyhow!("could not write {}: {e}", dest.display()))
+    }
+
     fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<()> {
         let _: Value = self.call("setMyCommands", &set_my_commands_body(commands), SHORT_TIMEOUT)?;
         Ok(())
@@ -308,9 +604,35 @@ impl TelegramApi for FailingTelegram {
     fn edit_message(&self, _chat_id: i64, _message_id: i64, _text: &str, _markup: &Value) -> Result<()> {
         Err(anyhow!("{}", self.0))
     }
+    fn edit_text(&self, _chat_id: i64, _message_id: i64, _text: &str) -> Result<()> {
+        Err(anyhow!("{}", self.0))
+    }
+    fn pin_message(&self, _chat_id: i64, _message_id: i64) -> Result<()> {
+        Err(anyhow!("{}", self.0))
+    }
+    fn unpin_message(&self, _chat_id: i64, _message_id: i64) -> Result<()> {
+        Err(anyhow!("{}", self.0))
+    }
+    fn delete_message(&self, _chat_id: i64, _message_id: i64) -> Result<()> {
+        Err(anyhow!("{}", self.0))
+    }
+    fn send_file(&self, _c: i64, _k: FileKind, _p: &Path, _cap: &str, _h: bool, _r: Option<i64>) -> Result<i64> {
+        Err(anyhow!("{}", self.0))
+    }
     fn set_my_commands(&self, _commands: &[(&str, &str)]) -> Result<()> {
         Err(anyhow!("{}", self.0))
     }
+}
+
+/// A file the fake accepted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FakeFile {
+    pub chat_id: i64,
+    pub kind: FileKind,
+    pub path: PathBuf,
+    pub caption: String,
+    pub html: bool,
+    pub reply_to: Option<i64>,
 }
 
 /// In-memory API for tests.
@@ -340,8 +662,24 @@ pub struct FakeTelegram {
     pub answers: RefCell<Vec<(String, String)>>,
     /// `(chat_id, message_id, text, markup)` per `edit_message` call.
     pub edits: RefCell<Vec<(i64, i64, String, Value)>>,
+    /// `(chat_id, message_id, text)` per accepted `edit_text` call.
+    pub text_edits: RefCell<Vec<(i64, i64, String)>>,
+    /// `(chat_id, message_id)` per accepted `pin_message` call.
+    pub pins: RefCell<Vec<(i64, i64)>>,
+    /// `(chat_id, message_id)` per accepted `unpin_message` call.
+    pub unpins: RefCell<Vec<(i64, i64)>>,
+    /// `(chat_id, message_id)` per accepted `delete_message` call.
+    pub deletes: RefCell<Vec<(i64, i64)>>,
+    pub fail_pin: Cell<bool>,
+    pub fail_delete: Cell<bool>,
+    /// One entry per accepted `send_file` call (also in `ids`).
+    pub files: RefCell<Vec<FakeFile>>,
     /// `allowed_updates` the poller asked for is fixed; the fake just counts polls.
     pub polls: Cell<usize>,
+    /// Downloadable files by `file_id`: `(file_path, bytes)`; `file_size` is the byte length.
+    pub downloads: RefCell<std::collections::HashMap<String, (String, Vec<u8>)>>,
+    /// `file_id` per `get_file` call.
+    pub file_requests: RefCell<Vec<String>>,
 }
 
 impl FakeTelegram {
@@ -366,7 +704,21 @@ impl FakeTelegram {
             answers: RefCell::new(Vec::new()),
             edits: RefCell::new(Vec::new()),
             polls: Cell::new(0),
+            text_edits: RefCell::new(Vec::new()),
+            pins: RefCell::new(Vec::new()),
+            unpins: RefCell::new(Vec::new()),
+            deletes: RefCell::new(Vec::new()),
+            fail_pin: Cell::new(false),
+            fail_delete: Cell::new(false),
+            files: RefCell::new(Vec::new()),
+            downloads: RefCell::new(std::collections::HashMap::new()),
+            file_requests: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Makes `file_id` downloadable as `file_path` with `bytes`.
+    pub fn add_download(&self, file_id: &str, file_path: &str, bytes: &[u8]) {
+        self.downloads.borrow_mut().insert(file_id.to_string(), (file_path.to_string(), bytes.to_vec()));
     }
 
     /// A fake whose `get_me` fails with `msg`.
@@ -439,6 +791,82 @@ impl TelegramApi for FakeTelegram {
         Ok(())
     }
 
+    fn edit_text(&self, chat_id: i64, message_id: i64, text: &str) -> Result<()> {
+        self.text_edits.borrow_mut().push((chat_id, message_id, text.to_string()));
+        Ok(())
+    }
+
+    fn pin_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        if self.fail_pin.get() {
+            return Err(anyhow!("fake pinChatMessage failure"));
+        }
+        self.pins.borrow_mut().push((chat_id, message_id));
+        Ok(())
+    }
+
+    fn unpin_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        self.unpins.borrow_mut().push((chat_id, message_id));
+        Ok(())
+    }
+
+    fn delete_message(&self, chat_id: i64, message_id: i64) -> Result<()> {
+        if self.fail_delete.get() {
+            return Err(anyhow!("Telegram API error: Bad Request: message can't be deleted"));
+        }
+        self.deletes.borrow_mut().push((chat_id, message_id));
+        Ok(())
+    }
+
+    fn send_file(
+        &self,
+        chat_id: i64,
+        kind: FileKind,
+        path: &Path,
+        caption: &str,
+        html: bool,
+        reply_to: Option<i64>,
+    ) -> Result<i64> {
+        if self.fail_send.get() {
+            return Err(anyhow!("fake {} failure", kind.method()));
+        }
+        if html && self.reject_html.get() {
+            return Err(anyhow!("Telegram API error: Bad Request: can't parse entities"));
+        }
+        let id = self.next_id.get() + 1;
+        self.next_id.set(id);
+        self.ids.borrow_mut().push((id, chat_id, caption.to_string()));
+        self.files.borrow_mut().push(FakeFile {
+            chat_id,
+            kind,
+            path: path.to_path_buf(),
+            caption: caption.to_string(),
+            html,
+            reply_to,
+        });
+        Ok(id)
+    }
+
+    fn get_file(&self, file_id: &str) -> Result<FileInfo> {
+        self.file_requests.borrow_mut().push(file_id.to_string());
+        match self.downloads.borrow().get(file_id) {
+            Some((p, b)) => Ok(FileInfo { file_path: Some(p.clone()), file_size: Some(b.len() as u64) }),
+            None => Err(anyhow!("Telegram API error: Bad Request: wrong file_id")),
+        }
+    }
+
+    fn download_file(&self, file_path: &str, dest: &Path, max_bytes: u64) -> Result<()> {
+        let map = self.downloads.borrow();
+        let Some((_, bytes)) = map.values().find(|(p, _)| p == file_path) else {
+            return Err(anyhow!("file download failed (HTTP 404)"));
+        };
+        if bytes.len() as u64 > max_bytes {
+            return Err(anyhow!("file too big"));
+        }
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(dest)?;
+        std::io::Write::write_all(&mut f, bytes)?;
+        Ok(())
+    }
+
     fn set_my_commands(&self, commands: &[(&str, &str)]) -> Result<()> {
         if self.fail_commands.get() {
             return Err(anyhow!("fake setMyCommands failure"));
@@ -456,6 +884,48 @@ impl TelegramApi for FakeTelegram {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multipart_body_format() {
+        let body = multipart_body(
+            "BND",
+            &[("chat_id", "42"), ("caption", "hi \"x\"")],
+            "photo",
+            "a\"b\r\n.png",
+            "image/png",
+            &[1, 2, 255],
+        );
+        let mut expect = Vec::new();
+        expect.extend_from_slice(
+            b"--BND\r\nContent-Disposition: form-data; name=\"chat_id\"\r\n\r\n42\r\n\
+--BND\r\nContent-Disposition: form-data; name=\"caption\"\r\n\r\nhi \"x\"\r\n\
+--BND\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"a_b__.png\"\r\nContent-Type: image/png\r\n\r\n",
+        );
+        expect.extend_from_slice(&[1, 2, 255]);
+        expect.extend_from_slice(b"\r\n--BND--\r\n");
+        assert_eq!(body, expect);
+    }
+
+    #[test]
+    fn content_type_from_extension() {
+        for (f, t) in [
+            ("a.jpg", "image/jpeg"),
+            ("a.JPEG", "image/jpeg"),
+            ("a.png", "image/png"),
+            ("a.gif", "image/gif"),
+            ("a.webp", "image/webp"),
+            ("a.pdf", "application/octet-stream"),
+            ("noext", "application/octet-stream"),
+        ] {
+            assert_eq!(guess_content_type(Path::new(f)), t, "{f}");
+        }
+    }
+
+    #[test]
+    fn boundary_avoids_data() {
+        let b = pick_boundary(b"plain");
+        assert!(b.starts_with("----colony"));
+    }
 
     #[test]
     fn body_has_no_parse_mode() {

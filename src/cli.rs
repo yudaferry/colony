@@ -1,7 +1,7 @@
 //! clap definitions. Help text comes from the doc comments.
 
 use crate::backend::{AgentState, Direction};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -97,6 +97,122 @@ pub enum Cmd {
         #[command(subcommand)]
         cmd: TgCmd,
     },
+    /// Scheduled jobs (they run only while `colony telegram run` is running)
+    Schedule {
+        #[command(subcommand)]
+        cmd: SchedCmd,
+    },
+}
+
+/// Optional limits of a job. Times are "YYYY-MM-DD HH:MM" in the job's --tz (WIB by default).
+#[derive(Args, Debug, Clone, Default, PartialEq, Eq)]
+pub struct LimitArgs {
+    /// Remove the job after this many runs
+    #[arg(long, value_name = "N")]
+    pub times: Option<u32>,
+    /// No runs before this time, "YYYY-MM-DD HH:MM". Also takes telegram:<reply-id> (the request came
+    /// from the phone: finish and error notices go to that chat); repeat --from to give both
+    #[arg(long, value_name = "TIME|telegram:ID")]
+    pub from: Vec<String>,
+    /// Remove the job once this time is passed (no run at or after it), "YYYY-MM-DD HH:MM"
+    #[arg(long, value_name = "TIME")]
+    pub until: Option<String>,
+}
+
+impl LimitArgs {
+    /// The `--from` time (a value that is not `telegram:<id>`); at most one.
+    pub fn start(&self) -> Result<Option<&str>, String> {
+        let mut t = self.from.iter().map(String::as_str).filter(|v| !v.starts_with("telegram:"));
+        let first = t.next();
+        if t.next().is_some() {
+            return Err("--from time given twice".to_string());
+        }
+        Ok(first)
+    }
+
+    /// The `--from telegram:<reply-id>` origin, if given (at most one).
+    pub fn origin(&self) -> Result<Option<Origin>, String> {
+        let mut o = self.from.iter().filter(|v| v.starts_with("telegram:"));
+        let first = o.next().map(|v| parse_origin(v)).transpose()?;
+        if o.next().is_some() {
+            return Err("--from telegram:<reply-id> given twice".to_string());
+        }
+        Ok(first)
+    }
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SchedCmd {
+    /// List the jobs with their next run (WIB)
+    List,
+    /// Add a job that sends a message to a session, which answers on the phone
+    AddMessage {
+        /// Job id (letters, digits, '-' and '_')
+        id: String,
+        /// 5-field cron expression: minute hour day month weekday
+        #[arg(long)]
+        cron: String,
+        /// IANA timezone of the cron expression
+        #[arg(long, default_value = "Asia/Jakarta")]
+        tz: String,
+        #[command(flatten)]
+        limits: LimitArgs,
+        /// Session name or pane id that receives the message
+        target: String,
+        /// Message text
+        #[arg(allow_hyphen_values = true)]
+        message: String,
+    },
+    /// Add a job that runs a shell command; it alerts the phone on a non-zero exit or any output
+    AddCommand {
+        /// Job id (letters, digits, '-' and '_')
+        id: String,
+        /// 5-field cron expression: minute hour day month weekday
+        #[arg(long)]
+        cron: String,
+        /// IANA timezone of the cron expression
+        #[arg(long, default_value = "Asia/Jakarta")]
+        tz: String,
+        /// Also forward the output to this session so it can investigate
+        #[arg(long, value_name = "SESSION")]
+        notify: Option<String>,
+        #[command(flatten)]
+        limits: LimitArgs,
+        /// Shell command (run with `sh -c` in $HOME, 120 s timeout)
+        #[arg(allow_hyphen_values = true)]
+        command: String,
+    },
+    /// Remove a job
+    Rm {
+        /// Job id
+        id: String,
+    },
+    /// Pause a job: `pause <id> 30m|2h|1d` or `pause <id> until "YYYY-MM-DD HH:MM"`. Skipped runs are not replayed
+    Pause {
+        /// Job id
+        id: String,
+        /// A duration (30m, 2h, 1d) or `until "YYYY-MM-DD HH:MM"`
+        #[arg(num_args = 1..=2, required = true)]
+        when: Vec<String>,
+        /// IANA timezone of the `until` time
+        #[arg(long, default_value = "Asia/Jakarta")]
+        tz: String,
+    },
+    /// End a pause early
+    Resume {
+        /// Job id
+        id: String,
+    },
+    /// Enable a job
+    Enable {
+        /// Job id
+        id: String,
+    },
+    /// Disable a job (kept in the file, never fires)
+    Disable {
+        /// Job id
+        id: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -126,9 +242,15 @@ pub enum TgCmd {
     Reply {
         /// Reply id from the message envelope
         reply_id: String,
-        /// Answer text
-        #[arg(allow_hyphen_values = true)]
-        text: String,
+        /// Answer text (optional with --photo / --file)
+        #[arg(allow_hyphen_values = true, required_unless_present_any = ["photo", "file"])]
+        text: Option<String>,
+        /// Send this image (sendPhoto, up to 10 MB); the text becomes its caption
+        #[arg(long, value_name = "PATH", conflicts_with = "file")]
+        photo: Option<PathBuf>,
+        /// Send this file as a document (sendDocument, up to 50 MB); the text becomes its caption
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
     },
     /// Run the bot loop
     Run,
@@ -199,9 +321,9 @@ mod tests {
     #[test]
     fn reply_text_may_start_with_hyphen() {
         match parse(&["colony", "telegram", "reply", "k3f9qa", "- done\n- tests pass"]).cmd.unwrap() {
-            Cmd::Telegram { cmd: TgCmd::Reply { reply_id, text } } => {
+            Cmd::Telegram { cmd: TgCmd::Reply { reply_id, text, .. } } => {
                 assert_eq!(reply_id, "k3f9qa");
-                assert_eq!(text, "- done\n- tests pass");
+                assert_eq!(text.as_deref(), Some("- done\n- tests pass"));
             }
             c => panic!("{c:?}"),
         }
@@ -294,12 +416,88 @@ mod tests {
     #[test]
     fn telegram_reply_args() {
         match parse(&["colony", "telegram", "reply", "k3f9qa", "done"]).cmd.unwrap() {
-            Cmd::Telegram { cmd: TgCmd::Reply { reply_id, text } } => {
+            Cmd::Telegram { cmd: TgCmd::Reply { reply_id, text, photo, file } } => {
                 assert_eq!(reply_id, "k3f9qa");
-                assert_eq!(text, "done");
+                assert_eq!(text.as_deref(), Some("done"));
+                assert_eq!((photo, file), (None, None));
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn telegram_reply_photo_and_file_args() {
+        match parse(&["colony", "telegram", "reply", "k3f9qa", "--photo", "/tmp/a.png"]).cmd.unwrap() {
+            Cmd::Telegram { cmd: TgCmd::Reply { text, photo, file, .. } } => {
+                assert_eq!(text, None);
+                assert_eq!(photo, Some(PathBuf::from("/tmp/a.png")));
+                assert_eq!(file, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match parse(&["colony", "telegram", "reply", "k3f9qa", "cap", "--file", "r.pdf"]).cmd.unwrap() {
+            Cmd::Telegram { cmd: TgCmd::Reply { text, file, .. } } => {
+                assert_eq!(text.as_deref(), Some("cap"));
+                assert_eq!(file, Some(PathBuf::from("r.pdf")));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["colony", "telegram", "reply", "k3f9qa"]).is_err());
+        assert!(Cli::try_parse_from(["colony", "telegram", "reply", "k", "--photo", "a", "--file", "b"]).is_err());
+    }
+
+    #[test]
+    fn schedule_args() {
+        match parse(&["colony", "schedule", "add-message", "m", "--cron", "0 9 * * *", "bo", "-hi"]).cmd.unwrap() {
+            Cmd::Schedule { cmd: SchedCmd::AddMessage { id, cron, tz, target, message, .. } } => {
+                assert_eq!((id.as_str(), cron.as_str(), tz.as_str()), ("m", "0 9 * * *", "Asia/Jakarta"));
+                assert_eq!((target.as_str(), message.as_str()), ("bo", "-hi"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["colony", "schedule", "add-command", "d", "--cron", "* * * * *", "--tz", "UTC", "--notify", "bo", "df -h"])
+            .cmd
+            .unwrap()
+        {
+            Cmd::Schedule { cmd: SchedCmd::AddCommand { tz, notify, command, .. } } => {
+                assert_eq!((tz.as_str(), notify.as_deref(), command.as_str()), ("UTC", Some("bo"), "df -h"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(Cli::try_parse_from(["colony", "schedule", "add-command", "d", "df"]).is_err(), "--cron is required");
+        assert!(matches!(parse(&["colony", "schedule", "rm", "x"]).cmd, Some(Cmd::Schedule { cmd: SchedCmd::Rm { .. } })));
+    }
+
+    #[test]
+    fn schedule_limit_and_pause_args() {
+        match parse(&[
+            "colony", "schedule", "add-command", "d", "--cron", "* * * * *", "--times", "3", "--from", "2026-10-30 09:00",
+            "--until", "2026-10-30 18:00", "df",
+        ])
+        .cmd
+        .unwrap()
+        {
+            Cmd::Schedule { cmd: SchedCmd::AddCommand { limits, .. } } => {
+                assert_eq!(limits.times, Some(3));
+                assert_eq!(limits.start().unwrap(), Some("2026-10-30 09:00"));
+                assert_eq!(limits.until.as_deref(), Some("2026-10-30 18:00"));
+            }
+            other => panic!("{other:?}"),
+        }
+        match parse(&["colony", "schedule", "add-message", "m", "--cron", "* * * * *", "--times", "2", "bo", "hi"]).cmd.unwrap() {
+            Cmd::Schedule { cmd: SchedCmd::AddMessage { limits, .. } } => assert_eq!(limits.times, Some(2)),
+            other => panic!("{other:?}"),
+        }
+        match parse(&["colony", "schedule", "pause", "x", "until", "2026-10-30 18:00"]).cmd.unwrap() {
+            Cmd::Schedule { cmd: SchedCmd::Pause { id, when, tz } } => {
+                assert_eq!((id.as_str(), when.len(), tz.as_str()), ("x", 2, "Asia/Jakarta"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(parse(&["colony", "schedule", "pause", "x", "2h"]).cmd, Some(Cmd::Schedule { cmd: SchedCmd::Pause { .. } })));
+        assert!(matches!(parse(&["colony", "schedule", "resume", "x"]).cmd, Some(Cmd::Schedule { cmd: SchedCmd::Resume { .. } })));
+        assert!(Cli::try_parse_from(["colony", "schedule", "pause", "x"]).is_err());
+        assert!(Cli::try_parse_from(["colony", "schedule", "add-command", "d", "--cron", "* * * * *", "--times", "x", "df"]).is_err());
     }
 
     #[test]

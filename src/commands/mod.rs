@@ -4,6 +4,7 @@ pub mod close;
 pub mod list;
 pub mod read;
 pub mod register;
+pub mod schedule;
 pub mod send;
 pub mod spawn;
 pub mod wait;

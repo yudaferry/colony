@@ -4,5 +4,7 @@ pub mod api;
 pub mod bot;
 pub mod cmds;
 pub mod format;
+pub mod inbox;
+pub mod sched;
 pub mod reply_id;
 pub mod split;

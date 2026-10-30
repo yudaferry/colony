@@ -1,5 +1,33 @@
 # Release Notes
 
+## colony 1.4.0 — 2026-10-30 (WIB, UTC+7)
+
+### New
+
+- **Scheduler** (runs inside `colony telegram run`; nothing runs while the bot is stopped). Jobs live in `~/.colony/schedule.json`, cron times are 5-field (minimum 1 minute), default timezone Asia/Jakarta, missed runs are not replayed.
+  - **Message jobs** send a task to a session at set times; the session answers on the phone.
+  - **Command jobs** run a shell command (120 s timeout) and alert only on output or a non-zero exit — no Claude tokens when all is quiet. `--notify <session>` also forwards the output to a session to investigate.
+  - **Limits and pause:** `--times N`, `--until "<time>"`, `--from "<time>"`, `colony schedule pause <id> <30m|2h|1d>` or `pause <id> until "<time>"`, `resume`, `enable`, `disable`, `rm`, `list`.
+  - **Origin tracking:** each job records who created it (the session, and `--from telegram:<reply-id>` for phone requests). "🏁 finished" and "⚠️ job error" notices go back to that origin (phone or session).
+  - Uses the `croner` crate.
+- **Receive images and files from the phone.** Photos and documents (up to 20 MB) are saved to `~/.colony/inbox/` (private) and forwarded to the current or swipe-replied session with an `Attachment:` path, so Claude can open them. Files older than 7 days are deleted automatically.
+- **Send images and files to the phone:** `colony telegram reply <id> "<caption>" --photo <path>` (up to 10 MB) or `--file <path>` (up to 50 MB).
+- **Pinned "📌 CURRENT SESSION" bar** at the top of the chat, replaced whenever the default session changes (buttons, `/use`, or `colony telegram receiver`).
+
+### Changed
+
+- Telegram commands trimmed to **`/list` and `/use`**; scheduling and everything else is done by typing normally to a session. Other `/…` messages get a short hint.
+- `/use` buttons disappear after a tap and the message shows the chosen session; the "🚫 off" button is removed (typing `/use off` still works).
+
+### Download
+
+Download `colony-1.4.0-x86_64-linux.tar.gz` (static Linux x86_64 build, with a `.sha256` file), then:
+
+```bash
+tar xzf colony-1.4.0-x86_64-linux.tar.gz
+./colony --help
+```
+
 ## colony 1.3.0 — 2026-10-30 (WIB, UTC+7)
 
 ### New

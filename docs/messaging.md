@@ -51,7 +51,7 @@ The receiving session answers with `colony telegram reply <id> "<answer>"`, whic
 ## Reply IDs
 
 - A reply ID is 6 characters from `[a-z0-9]`, so it is safe to type in a shell.
-- The bot creates one for every message it forwards (`/send` and plain text to the receiver) and stores it in `pending.json` with the target, chat id and message id.
+- The bot creates one for every message it forwards (plain text to the default session) and stores it in `pending.json` with the target, chat id and message id.
 - An ID is valid for **24 hours** and can be **used more than once**, so a session can send progress and then a final answer.
 - Expired entries are pruned whenever a new ID is created.
 - `colony telegram reply` accepts any caller that knows a valid ID; it does not check who calls it. An unknown or expired ID is an error and nothing is sent.

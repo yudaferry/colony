@@ -30,6 +30,12 @@ pub struct TelegramConfig {
     /// Pane colony created for the bot (`connect --new-pane`); only this pane is closed by `disconnect`.
     #[serde(default)]
     pub bot_pane: Option<String>,
+    /// Id of the pinned "current session" message in the locked chat.
+    #[serde(default)]
+    pub pinned_message_id: Option<i64>,
+    /// Text of that pinned message, to tell whether the default changed.
+    #[serde(default)]
+    pub pinned_text: Option<String>,
 }
 
 impl TelegramConfig {

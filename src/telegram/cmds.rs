@@ -1,8 +1,8 @@
 //! `colony telegram reply | connect | disconnect | status | receiver`.
 //! The bot token never appears in output, errors or logs.
 
-use super::api::TelegramApi;
-use super::format::send_markdown;
+use super::api::{CAPTION_LIMIT, FileKind, TelegramApi};
+use super::format::{send_markdown, sender_header, to_chunks};
 use crate::discover::discover;
 use crate::backend::{Direction, detect_env};
 use crate::commands::log;
@@ -14,7 +14,7 @@ use crate::state::sent::{SENT_FILE, SENT_MODE, Sent};
 use crate::state::telegram::{TELEGRAM_FILE, TELEGRAM_MODE, TelegramConfig};
 use crate::telegram::reply_id::PENDING_MODE;
 use anyhow::{Result, anyhow, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Name under which the bot pane is registered.
 pub const BOT_NAME: &str = "telegram-bot";
@@ -25,9 +25,58 @@ fn read_config(ctx: &Ctx) -> Result<TelegramConfig> {
     ctx.state.read_json(TELEGRAM_FILE)
 }
 
+/// A file to send with a reply (`--photo` / `--file`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Attachment {
+    pub kind: FileKind,
+    pub path: PathBuf,
+}
+
+fn utf16_len(s: &str) -> usize {
+    s.chars().map(char::len_utf16).sum()
+}
+
+/// Checks the file before any network call: exists, regular file, not empty, within the size limit.
+fn validate_attachment(a: &Attachment) -> Result<()> {
+    let flag = if a.kind == FileKind::Photo { "--photo" } else { "--file" };
+    let shown = a.path.display();
+    let meta = std::fs::metadata(&a.path).map_err(|e| anyhow!("{flag}: cannot read {shown}: {e}"))?;
+    if !meta.is_file() {
+        bail!("{flag}: {shown} is not a regular file");
+    }
+    if meta.len() == 0 {
+        bail!("{flag}: {shown} is empty");
+    }
+    let max = a.kind.max_bytes();
+    if meta.len() > max {
+        bail!(
+            "{flag}: {shown} is {} bytes, over the {} MB limit for {}",
+            meta.len(),
+            max / (1024 * 1024),
+            if a.kind == FileKind::Photo { "photos" } else { "documents" }
+        );
+    }
+    Ok(())
+}
+
 /// `colony telegram reply <id> <text>`: any caller holding a valid ID may reply (FR-28).
 /// Unknown/expired ID or no connection: error, no network call.
 pub fn reply(ctx: &Ctx, api: &dyn TelegramApi, reply_id: &str, text: &str) -> Result<String> {
+    reply_with(ctx, api, reply_id, Some(text), None)
+}
+
+/// `reply` with an optional text and an optional photo/document.
+pub fn reply_with(
+    ctx: &Ctx,
+    api: &dyn TelegramApi,
+    reply_id: &str,
+    text: Option<&str>,
+    attach: Option<&Attachment>,
+) -> Result<String> {
+    let text = text.filter(|t| !t.trim().is_empty());
+    if text.is_none() && attach.is_none() {
+        bail!("give the answer text, or --photo <path> / --file <path>");
+    }
     let cfg = read_config(ctx)?;
     if cfg.token.is_none() {
         bail!("telegram is not connected. Run: colony telegram connect <token>");
@@ -36,9 +85,17 @@ pub fn reply(ctx: &Ctx, api: &dyn TelegramApi, reply_id: &str, text: &str) -> Re
     let Some(entry) = pending.get_valid(reply_id, ctx.clock.now()) else {
         bail!("reply id {reply_id} unknown or expired (valid 24 h)");
     };
+    if let Some(a) = attach {
+        validate_attachment(a)?;
+    }
     let names: Names = ctx.state.read_json(NAMES_FILE)?;
     let (sender, target) = sender_name(ctx, &names, &entry.target);
-    let ids = send_markdown(api, entry.chat_id, text, Some(entry.message_id), Some(&sender))?;
+    // A scheduled message has no phone message to quote (message_id 0).
+    let quoted = (entry.message_id > 0).then_some(entry.message_id);
+    let ids = match attach {
+        None => send_markdown(api, entry.chat_id, text.unwrap_or_default(), quoted, Some(&sender))?,
+        Some(a) => send_attachment(api, entry.chat_id, a, text, quoted, &sender)?,
+    };
     // Remember who sent these messages, so a swipe-reply goes back to that session.
     // The messages are out already: a failed record is reported, not fatal.
     let chat_id = entry.chat_id;
@@ -61,6 +118,45 @@ pub fn reply(ctx: &Ctx, api: &dyn TelegramApi, reply_id: &str, text: &str) -> Re
         },
     );
     Ok(format!("Sent to Telegram (reply id {reply_id})"))
+}
+
+/// Sends the file with the sender header and the text as caption. A text that does not fit the
+/// caption limit goes out as normal messages after a header-only caption.
+fn send_attachment(
+    api: &dyn TelegramApi,
+    chat_id: i64,
+    a: &Attachment,
+    text: Option<&str>,
+    reply_to: Option<i64>,
+    sender: &str,
+) -> Result<Vec<i64>> {
+    let (hh, hp) = sender_header(sender);
+    let head_html = hh.trim_end().to_string();
+    let head_plain = hp.trim_end().to_string();
+    let mut caption: Option<(String, String)> = None;
+    if let Some(t) = text {
+        let room = CAPTION_LIMIT.saturating_sub(utf16_len(&hh).max(utf16_len(&hp)));
+        let chunks = to_chunks(t, room);
+        if let [c] = chunks.as_slice()
+            && !c.plain_only
+            && utf16_len(&format!("{hp}{}", c.plain)) <= CAPTION_LIMIT
+        {
+            caption = Some((format!("{hh}{}", c.html), format!("{hp}{}", c.plain)));
+        }
+    }
+    let (html, plain, rest) = match caption {
+        Some((h, p)) => (h, p, None),
+        None => (head_html, head_plain, text),
+    };
+    let first = match api.send_file(chat_id, a.kind, &a.path, &html, true, reply_to) {
+        Ok(id) => id,
+        Err(_) => api.send_file(chat_id, a.kind, &a.path, &plain, false, reply_to)?,
+    };
+    let mut ids = vec![first];
+    if let Some(t) = rest {
+        ids.extend(send_markdown(api, chat_id, t, None, None)?);
+    }
+    Ok(ids)
 }
 
 /// Name for the reply header: the calling pane's registered name, else its discovered
@@ -332,6 +428,21 @@ pub fn receiver(ctx: &Ctx, name: Option<&str>, clear: bool) -> Result<String> {
     }
 }
 
+/// `receiver`, then refreshes the pinned session bar through the saved token. Not connected or
+/// not locked: skipped. A bar failure is reported on stderr and never fails the change.
+pub fn receiver_pinned(ctx: &Ctx, api_for: ApiFactory, name: Option<&str>, clear: bool) -> Result<String> {
+    let out = receiver(ctx, name, clear)?;
+    if let Ok(cfg) = read_config(ctx) {
+        if let Some(token) = cfg.token.as_deref() {
+            let api = api_for(token);
+            if let Err(e) = crate::telegram::bot::sync_pin(ctx, api.as_ref()) {
+                eprintln!("colony telegram: could not update the pinned session bar: {e:#}");
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +578,138 @@ mod tests {
         let m = &api.sent.borrow()[0].1;
         assert!(m.starts_with("\u{1f916} <b>A&lt;B&gt;&amp;**C</b>\n"), "{m}");
         assert_eq!(m.matches("<b>").count(), 1);
+    }
+
+    fn tmp_file(name: &str, size: usize) -> (tempfile::TempDir, PathBuf) {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(name);
+        std::fs::write(&p, vec![7u8; size]).unwrap();
+        (d, p)
+    }
+
+    fn setup_reply() -> Harness {
+        let h = Harness::herdr();
+        connected(&h);
+        add_pending(&h, "k3f9qa", Duration::minutes(1));
+        h.add_name("bo", BackendKind::Herdr, "w1:p1", Kind::Claude);
+        h
+    }
+
+    fn photo(p: &Path) -> Attachment {
+        Attachment { kind: FileKind::Photo, path: p.to_path_buf() }
+    }
+
+    #[test]
+    fn photo_with_short_caption() {
+        let h = setup_reply();
+        let (_d, p) = tmp_file("a.png", 100);
+        let api = FakeTelegram::new();
+        reply_with(&h.ctx(), &api, "k3f9qa", Some("**ok** done"), Some(&photo(&p))).unwrap();
+        let files = api.files.borrow();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].kind, FileKind::Photo);
+        assert_eq!(files[0].path, p);
+        assert_eq!(files[0].caption, format!("{}<b>ok</b> done", hdr_html("BO")));
+        assert!(files[0].html);
+        assert_eq!((files[0].chat_id, files[0].reply_to), (42, Some(7)));
+        assert!(api.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn photo_without_text_has_header_only_caption() {
+        let h = setup_reply();
+        let (_d, p) = tmp_file("a.jpg", 10);
+        let api = FakeTelegram::new();
+        reply_with(&h.ctx(), &api, "k3f9qa", None, Some(&photo(&p))).unwrap();
+        assert_eq!(api.files.borrow()[0].caption, hdr_html("BO").trim_end());
+        assert!(api.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn long_caption_becomes_header_caption_plus_text() {
+        let h = setup_reply();
+        let (_d, p) = tmp_file("a.png", 10);
+        let api = FakeTelegram::new();
+        let text = "a".repeat(1500);
+        reply_with(&h.ctx(), &api, "k3f9qa", Some(&text), Some(&photo(&p))).unwrap();
+        let files = api.files.borrow();
+        assert_eq!(files[0].caption, hdr_html("BO").trim_end());
+        assert!(utf16_len(&files[0].caption) <= CAPTION_LIMIT);
+        let sent = api.sent.borrow();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].1, text);
+        assert_eq!(sent[0].2, None);
+    }
+
+    #[test]
+    fn caption_html_rejected_falls_back_to_plain() {
+        let h = setup_reply();
+        let (_d, p) = tmp_file("a.png", 10);
+        let api = FakeTelegram::new();
+        api.reject_html.set(true);
+        reply_with(&h.ctx(), &api, "k3f9qa", Some("**x**"), Some(&photo(&p))).unwrap();
+        let files = api.files.borrow();
+        assert_eq!(files.len(), 1);
+        assert!(!files[0].html);
+        assert_eq!(files[0].caption, format!("{}**x**", hdr("BO")));
+    }
+
+    #[test]
+    fn bad_files_error_without_network() {
+        let h = setup_reply();
+        let d = tempfile::tempdir().unwrap();
+        let api = FakeTelegram::new();
+        let missing = photo(&d.path().join("nope.png"));
+        let err = reply_with(&h.ctx(), &api, "k3f9qa", Some("x"), Some(&missing)).unwrap_err().to_string();
+        assert!(err.contains("--photo") && err.contains("nope.png"), "{err}");
+        let err = reply_with(&h.ctx(), &api, "k3f9qa", None, Some(&photo(d.path()))).unwrap_err().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
+        let (_d2, big) = tmp_file("big.png", 10 * 1024 * 1024 + 1);
+        let err = reply_with(&h.ctx(), &api, "k3f9qa", None, Some(&photo(&big))).unwrap_err().to_string();
+        assert!(err.contains("over the 10 MB limit"), "{err}");
+        // The same file is fine as a document (limit 50 MB).
+        let doc = Attachment { kind: FileKind::Document, path: big.clone() };
+        reply_with(&h.ctx(), &api, "k3f9qa", None, Some(&doc)).unwrap();
+        assert_eq!(api.files.borrow().len(), 1);
+        let (_d3, empty) = tmp_file("e.png", 0);
+        assert!(reply_with(&h.ctx(), &api, "k3f9qa", None, Some(&photo(&empty))).is_err());
+        assert_eq!(api.files.borrow().len(), 1);
+        assert!(api.sent.borrow().is_empty());
+    }
+
+    #[test]
+    fn no_text_and_no_file_is_an_error() {
+        let h = setup_reply();
+        let api = FakeTelegram::new();
+        assert!(reply_with(&h.ctx(), &api, "k3f9qa", None, None).is_err());
+        assert!(reply_with(&h.ctx(), &api, "k3f9qa", Some("  "), None).is_err());
+    }
+
+    #[test]
+    fn file_uses_send_document() {
+        let h = setup_reply();
+        let (_d, p) = tmp_file("report.pdf", 10);
+        let api = FakeTelegram::new();
+        let a = Attachment { kind: FileKind::Document, path: p };
+        reply_with(&h.ctx(), &api, "k3f9qa", Some("see attached"), Some(&a)).unwrap();
+        let files = api.files.borrow();
+        assert_eq!(files[0].kind, FileKind::Document);
+        assert_eq!(files[0].caption, format!("{}see attached", hdr_html("BO")));
+    }
+
+    #[test]
+    fn file_send_records_ids_in_sent_json() {
+        let h = setup_reply();
+        let (_d, p) = tmp_file("a.png", 10);
+        let api = FakeTelegram::new();
+        reply_with(&h.ctx(), &api, "k3f9qa", Some(&"b".repeat(1500)), Some(&photo(&p))).unwrap();
+        let ids: Vec<i64> = api.ids.borrow().iter().map(|(id, _, _)| *id).collect();
+        assert_eq!(ids.len(), 2);
+        let sent: Sent = h.state.read_json(SENT_FILE).unwrap();
+        for id in ids {
+            assert_eq!(sent.target_of(42, id, h.clock.0), Some("bo"));
+        }
+        assert_eq!(mode(&h, SENT_FILE), 0o600);
     }
 
     fn exe() -> &'static Path {
@@ -941,5 +1184,58 @@ mod tests {
         assert_eq!(shell_word("/usr/bin/colony"), "/usr/bin/colony");
         assert_eq!(shell_word("/my dir/colony"), "'/my dir/colony'");
         assert_eq!(shell_word("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn cli_receiver_updates_the_pinned_bar() {
+        use std::rc::Rc;
+        struct Shared(Rc<FakeTelegram>);
+        impl TelegramApi for Shared {
+            fn get_me(&self) -> Result<super::super::api::BotInfo> {
+                self.0.get_me()
+            }
+            fn get_updates(&self, o: i64, t: u64) -> Result<Vec<super::super::api::Update>> {
+                self.0.get_updates(o, t)
+            }
+            fn send_message(&self, c: i64, t: &str, r: Option<i64>) -> Result<i64> {
+                self.0.send_message(c, t, r)
+            }
+            fn pin_message(&self, c: i64, m: i64) -> Result<()> {
+                self.0.pin_message(c, m)
+            }
+            fn unpin_message(&self, c: i64, m: i64) -> Result<()> {
+                self.0.unpin_message(c, m)
+            }
+            fn delete_message(&self, c: i64, m: i64) -> Result<()> {
+                self.0.delete_message(c, m)
+            }
+            fn set_my_commands(&self, c: &[(&str, &str)]) -> Result<()> {
+                self.0.set_my_commands(c)
+            }
+        }
+        let h = Harness::herdr();
+        connected(&h);
+        let fake = Rc::new(FakeTelegram::new());
+        let f = |_t: &str| -> Box<dyn TelegramApi> { Box::new(Shared(fake.clone())) };
+        // Not locked: skipped, the change still happens.
+        receiver_pinned(&h.ctx(), &f, Some("bo"), false).unwrap();
+        assert!(fake.ids.borrow().is_empty());
+        set_cfg(&h, |c| {
+            c.locked_user_id = Some(42);
+            c.locked_chat_id = Some(42);
+        });
+        receiver_pinned(&h.ctx(), &f, Some("Team"), false).unwrap();
+        let cfg: TelegramConfig = h.state.read_json(TELEGRAM_FILE).unwrap();
+        let id = cfg.pinned_message_id.unwrap();
+        assert!(fake.ids.borrow().iter().any(|(i, c, t)| *i == id && *c == 42 && t == "\u{1f4cc} CURRENT SESSION: TEAM"));
+        assert_eq!(fake.pins.borrow().as_slice(), &[(42, id)]);
+        receiver_pinned(&h.ctx(), &f, None, true).unwrap();
+        assert_eq!(fake.unpins.borrow().as_slice(), &[(42, id)]);
+        assert_eq!(fake.deletes.borrow().as_slice(), &[(42, id)]);
+        let cfg: TelegramConfig = h.state.read_json(TELEGRAM_FILE).unwrap();
+        let new = cfg.pinned_message_id.unwrap();
+        assert_ne!(new, id);
+        assert!(fake.ids.borrow().iter().any(|(i, _, t)| *i == new && t == "\u{1f4cc} CURRENT SESSION: none"));
+        assert_eq!(mode(&h, TELEGRAM_FILE), 0o600);
     }
 }

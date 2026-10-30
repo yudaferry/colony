@@ -4,13 +4,16 @@
 //! carrying a reply ID (FR-44, D-20).
 
 use super::cmds::bot_id_of;
+use super::inbox;
+use super::sched;
+use chrono::{DateTime, Utc};
 use super::api::{CallbackQuery, Message, TelegramApi, Update};
 use super::reply_id::{PENDING_MODE, create_pending};
-use super::split::{TG_LIMIT, split_message, tail_fit};
+use super::split::{TG_LIMIT, split_message};
 use crate::cli::Origin;
 use crate::commands::list::{ListRow, list_rows};
 use crate::commands::list::UNREGISTERED_NOTE;
-use crate::commands::{backend_str, read::read, send::send};
+use crate::commands::{backend_str, send::send};
 use crate::ctx::Ctx;
 use crate::discover::resolve;
 use crate::state::names::{NAMES_FILE, Names};
@@ -24,8 +27,6 @@ use std::time::Duration;
 
 const POLL_TIMEOUT_SECS: u64 = 30;
 const RETRY_SLEEP: Duration = Duration::from_secs(5);
-const DEFAULT_LAST_LINES: usize = 50;
-const MAX_LAST_LINES: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BotReply {
@@ -41,29 +42,23 @@ pub struct BotReply {
 pub struct CallbackReply {
     pub callback_id: String,
     pub toast: String,
-    /// `(chat_id, message_id, text, markup)` for `editMessageText`.
-    pub edit: Option<(i64, i64, String, Value)>,
+    /// `(chat_id, message_id, text, markup)` for `editMessageText`; no markup removes the keyboard.
+    pub edit: Option<(i64, i64, String, Option<Value>)>,
 }
 
+const ICON_SENT: &str = "\u{1f4e8}";
+const ICON_FILE: &str = "\u{1f4ce}";
 const USE_PROMPT: &str = "\u{1f3af} Choose default session:";
 /// Telegram's limit for `callback_data`.
 const CALLBACK_MAX: usize = 64;
 
-const HELP: &str = "\u{1f4cb} /list - list sessions\n\
-\u{1f3af} /use <name> - default session for plain text; /use alone shows buttons to pick one, /use off clears it\n\
-\u{1f4e8} /send <name> <msg> - send a message to a session\n\
-\u{1f4dc} /last <name> [lines] - show a session's recent output\n\
-\u{2753} /help - this help\n\
-Plain text goes to the default session (/use), if one is set.\n\
-Swipe-reply to a session's answer to send to that same session.";
+/// Answer to any `/word` other than `/list` and `/use`.
+pub const ONLY_HINT: &str = "\u{2139}\u{fe0f} only /list and /use \u{2014} type normally to talk to your session";
 
 /// The `/` menu registered with `setMyCommands`.
-pub const BOT_COMMANDS: [(&str, &str); 5] = [
+pub const BOT_COMMANDS: [(&str, &str); 2] = [
     ("list", "List sessions"),
     ("use", "Set default session: /use (buttons) | <name> | off"),
-    ("send", "Send to a session: /send <name> <msg>"),
-    ("last", "Recent output: /last <name> [lines]"),
-    ("help", "Show help"),
 ];
 
 /// Registers the command menu. A failure is logged to stderr and never stops the bot.
@@ -75,7 +70,7 @@ pub fn register_commands(ctx: &Ctx, api: &dyn TelegramApi) {
 }
 
 /// Splits `s` at the first whitespace: (first word, trimmed rest).
-fn first_word(s: &str) -> (&str, &str) {
+pub(super) fn first_word(s: &str) -> (&str, &str) {
     let s = s.trim();
     match s.split_once(char::is_whitespace) {
         Some((w, rest)) => (w, rest.trim()),
@@ -96,26 +91,42 @@ fn find_row(ctx: &Ctx, name: &str) -> Result<Option<ListRow>> {
     Ok(i.map(|i| rows.swap_remove(i)))
 }
 
+/// Where an answer goes: `(chat_id, message_id to quote)`; message id 0 quotes nothing.
+pub(crate) type Src = (i64, i64);
+
+fn src(msg: &Message) -> Src {
+    (msg.chat.id, msg.message_id)
+}
+
 /// Delivers `text` to the live session `row` and words the acknowledgement. A
 /// session blocked on a prompt is refused before any reply ID exists.
-fn deliver(ctx: &Ctx, msg: &Message, name: &str, row: &ListRow, text: &str) -> Result<String> {
+fn deliver(ctx: &Ctx, src: Src, name: &str, row: &ListRow, text: &str, icon: &str) -> Result<String> {
     if row.status == "blocked" {
         return Ok(format!("\u{26d4} not delivered: {name} is waiting on a prompt"));
     }
-    Ok(match forward(ctx, msg, name, text)? {
+    Ok(match forward(ctx, src, name, text)? {
         Ok(()) if row.status == "working" => {
-            format!("\u{1f4e8} sent to {name} (\u{23f3} busy \u{2014} it will answer after its current task)")
+            format!("{icon} sent to {name} (\u{23f3} busy \u{2014} it will answer after its current task)")
         }
-        Ok(()) => format!("\u{1f4e8} sent to {name}"),
+        Ok(()) => format!("{icon} sent to {name}"),
         Err(e) => format!("\u{26a0}\u{fe0f} could not send to {name}: {e}"),
     })
 }
 
+/// Delivers a scheduled message to session `target` with a new reply id for `chat_id` (nothing to
+/// quote). The acknowledgement starts with the scheduler icon on success, else says why not.
+pub(super) fn deliver_scheduled(ctx: &Ctx, chat_id: i64, target: &str, text: &str) -> Result<String> {
+    let Some(row) = find_row(ctx, target)? else {
+        return Ok(format!("\u{26a0}\u{fe0f} no session named {}", target.to_lowercase()));
+    };
+    deliver(ctx, (chat_id, 0), &target.to_lowercase(), &row, text, super::sched::ICON_SCHED)
+}
+
 /// New reply ID, then deliver with a Telegram envelope. A failed delivery
 /// removes the ID again.
-fn forward(ctx: &Ctx, msg: &Message, name: &str, text: &str) -> Result<Result<(), String>> {
+fn forward(ctx: &Ctx, src: Src, name: &str, text: &str) -> Result<Result<(), String>> {
     let lname = name.to_lowercase();
-    let id = create_pending(ctx.state, ctx.clock.now(), &lname, msg.chat.id, msg.message_id)?;
+    let id = create_pending(ctx.state, ctx.clock.now(), &lname, src.0, src.1)?;
     match send(ctx, text, name, false, Some(&Origin::Telegram(id.clone()))) {
         Ok(_) => Ok(Ok(())),
         Err(e) => {
@@ -164,17 +175,6 @@ fn cmd_list(ctx: &Ctx) -> Result<String> {
         out.push_str(UNREGISTERED_NOTE);
     }
     Ok(out)
-}
-
-fn cmd_send(ctx: &Ctx, msg: &Message, args: &str) -> Result<String> {
-    let (name, text) = first_word(args);
-    if name.is_empty() || text.is_empty() {
-        return Ok("\u{26a0}\u{fe0f} usage: /send <name> <message>".to_string());
-    }
-    let Some(row) = find_row(ctx, name)? else {
-        return Ok(format!("\u{26a0}\u{fe0f} no session named {}", name.to_lowercase()));
-    };
-    deliver(ctx, msg, &name.to_lowercase(), &row, text)
 }
 
 /// Sets the default session like `/use <arg>`: `Ok(lowercase name)` or `Err(message)`
@@ -228,7 +228,7 @@ fn button_data(row: &ListRow, index: usize) -> String {
 }
 
 /// The `/use` keyboard: one button per session (status dot + name, the default
-/// marked with a check), then "off".
+/// marked with a check). No "off" button; `/use off` clears by typing.
 fn use_keyboard(ctx: &Ctx) -> Result<Value> {
     let cfg: TelegramConfig = ctx.state.read_json(TELEGRAM_FILE)?;
     let current = cfg.receiver.as_deref().map(str::to_lowercase);
@@ -243,7 +243,6 @@ fn use_keyboard(ctx: &Ctx) -> Result<Value> {
             json!([{ "text": label, "callback_data": button_data(r, i) }])
         })
         .collect();
-    rows.push(json!([{ "text": "\u{1f6ab} off", "callback_data": "use:off" }]));
     Ok(json!({ "inline_keyboard": rows }))
 }
 
@@ -269,106 +268,109 @@ pub fn handle_callback(ctx: &Ctx, u: &Update) -> Result<Option<CallbackReply>> {
     let Some(data) = cq.data.as_deref().and_then(|d| d.strip_prefix("use:")) else {
         return Ok(None);
     };
-    let toast = if data == "off" {
+    // `done` is the final text of the tapped message once the default changed.
+    // `use:off` comes only from keyboards sent before the off button was removed.
+    let (toast, done) = if data == "off" {
         clear_default(ctx)?;
-        "\u{1f3af} default cleared".to_string()
+        ("\u{1f3af} default cleared".to_string(), Some("\u{1f3af} Default session cleared".to_string()))
     } else {
         pick(ctx, data)?
     };
-    Ok(Some(callback_reply(ctx, cq, msg, toast)?))
+    Ok(Some(callback_reply(ctx, cq, msg, toast, done)?))
 }
 
-/// Applies a session button; returns the toast.
-fn pick(ctx: &Ctx, data: &str) -> Result<String> {
+/// Applies a session button; returns the toast and, when the default changed, the
+/// text the tapped message becomes.
+fn pick(ctx: &Ctx, data: &str) -> Result<(String, Option<String>)> {
     let rows = list_rows(ctx)?;
     let row = match data.strip_prefix('#') {
         Some(i) => i.parse::<usize>().ok().and_then(|i| rows.get(i)),
         None => rows.iter().find(|r| r.pane_id == data),
     };
     let Some(row) = row else {
-        return Ok("\u{26a0}\u{fe0f} session gone".to_string());
+        return Ok(("\u{26a0}\u{fe0f} session gone".to_string(), None));
     };
     // The name, as `/use <name>` would; a discovered name shared by several
     // sessions is not usable, then the pane id is.
     let mut last = String::new();
     for arg in [row.name.as_str(), row.pane_id.as_str()] {
         match set_default(ctx, arg)? {
-            Ok(lname) => return Ok(format!("\u{1f3af} {lname}")),
+            Ok(lname) => {
+                return Ok((format!("\u{1f3af} {lname}"), Some(format!("\u{1f3af} Default session: {lname}"))));
+            }
             Err(msg) => last = msg,
         }
     }
-    Ok(last)
+    Ok((last, None))
 }
 
-fn callback_reply(ctx: &Ctx, cq: &CallbackQuery, msg: &Message, toast: String) -> Result<CallbackReply> {
+/// A changed default turns the tapped message into plain text (no keyboard); a
+/// failed pick keeps the buttons, refreshed.
+fn callback_reply(
+    ctx: &Ctx,
+    cq: &CallbackQuery,
+    msg: &Message,
+    toast: String,
+    done: Option<String>,
+) -> Result<CallbackReply> {
+    let (text, markup) = match done {
+        Some(text) => (text, None),
+        None => (USE_PROMPT.to_string(), Some(use_keyboard(ctx)?)),
+    };
     Ok(CallbackReply {
         callback_id: cq.id.clone(),
         toast,
-        edit: Some((msg.chat.id, msg.message_id, USE_PROMPT.to_string(), use_keyboard(ctx)?)),
+        edit: Some((msg.chat.id, msg.message_id, text, markup)),
     })
 }
 
-fn cmd_last(ctx: &Ctx, args: &str) -> Result<String> {
-    let (name, rest) = first_word(args);
-    if name.is_empty() {
-        return Ok("\u{26a0}\u{fe0f} usage: /last <name> [lines]".to_string());
-    }
-    let lines = if rest.is_empty() {
-        DEFAULT_LAST_LINES
-    } else {
-        match rest.parse::<usize>() {
-            Ok(n) => n.clamp(1, MAX_LAST_LINES),
-            Err(_) => return Ok("\u{26a0}\u{fe0f} usage: /last <name> [lines]".to_string()),
-        }
-    };
-    if find_row(ctx, name)?.is_none() {
-        return Ok(format!("\u{26a0}\u{fe0f} no session named {}", name.to_lowercase()));
-    }
-    Ok(match read(ctx, name, lines) {
-        Ok(out) => tail_fit(&out, TG_LIMIT),
-        Err(e) => format!("\u{26a0}\u{fe0f} could not read {}: {e:#}", name.to_lowercase()),
-    })
-}
-
-fn cmd_plain(ctx: &Ctx, msg: &Message, cfg: &TelegramConfig, text: &str) -> Result<String> {
+fn cmd_plain(ctx: &Ctx, msg: &Message, cfg: &TelegramConfig, text: &str, icon: &str) -> Result<String> {
     let Some(receiver) = cfg.receiver.as_deref() else {
-        return Ok("\u{2753} no session selected, use /use <name> or /send <name> <msg>".to_string());
+        return Ok("\u{2753} no session selected, use /use <name>".to_string());
     };
     let Some(row) = find_row(ctx, receiver)? else {
-        return Ok(format!("\u{26a0}\u{fe0f} receiver {receiver} not found, use /send"));
+        return Ok(format!("\u{26a0}\u{fe0f} receiver {receiver} not found, use /use"));
     };
-    deliver(ctx, msg, receiver, &row, text)
+    deliver(ctx, src(msg), receiver, &row, text, icon)
 }
 
 /// Plain text. A swipe-reply to a message `colony telegram reply` sent goes to the
-/// session that sent it (like `/send`, default untouched); any other message, or a
+/// session that sent it (default untouched); any other message, or a
 /// reply to an unknown one, follows the default session.
-fn cmd_reply_or_plain(ctx: &Ctx, msg: &Message, cfg: &TelegramConfig, text: &str) -> Result<String> {
+fn cmd_reply_or_plain(ctx: &Ctx, msg: &Message, cfg: &TelegramConfig, text: &str, icon: &str) -> Result<String> {
     if let Some(r) = &msg.reply_to_message {
         let sent: Sent = ctx.state.read_json(SENT_FILE)?;
         if let Some(target) = sent.target_of(msg.chat.id, r.message_id, ctx.clock.now()) {
             let Some(row) = find_row(ctx, target)? else {
                 return Ok(format!("\u{26a0}\u{fe0f} no session named {}", target.to_lowercase()));
             };
-            return deliver(ctx, msg, &target.to_lowercase(), &row, text);
+            return deliver(ctx, src(msg), &target.to_lowercase(), &row, text, icon);
         }
     }
-    cmd_plain(ctx, msg, cfg, text)
+    cmd_plain(ctx, msg, cfg, text, icon)
 }
 
-/// Handles one update. `None` means: say nothing.
-pub fn handle_update(ctx: &Ctx, u: &Update) -> Result<Option<BotReply>> {
-    let Some(msg) = &u.message else {
-        return Ok(None);
-    };
-    let Some(text) = &msg.text else {
-        return Ok(None);
-    };
+/// Result of the checks every message from the phone passes first.
+enum Gate {
+    /// Not for us: say nothing.
+    Ignore,
+    /// Answer this and do nothing else (the lock was just claimed).
+    Say(BotReply),
+    /// The locked user, in the private chat: carry on with this config.
+    Open(TelegramConfig),
+}
+
+fn say_to(msg: &Message, text: String) -> BotReply {
+    BotReply { chat_id: msg.chat.id, reply_to: msg.message_id, text, markup: None }
+}
+
+/// Private chat, known sender, not stale, and the lock (claimed by the first message).
+fn gate(ctx: &Ctx, msg: &Message) -> Result<Gate> {
     if msg.chat.kind != "private" {
-        return Ok(None);
+        return Ok(Gate::Ignore);
     }
     let Some(from) = &msg.from else {
-        return Ok(None);
+        return Ok(Gate::Ignore);
     };
     // Stale updates: Telegram replays up to 24 h of backlog. Anything sent before
     // the last connect is ignored entirely and never executed (D-15). `date` has
@@ -378,23 +380,16 @@ pub fn handle_update(ctx: &Ctx, u: &Update) -> Result<Option<BotReply>> {
     let cfg: TelegramConfig = ctx.state.read_json(TELEGRAM_FILE)?;
     if let Some(t) = cfg.connected_at {
         if msg.date <= t {
-            return Ok(None);
+            return Ok(Gate::Ignore);
         }
     }
-    let say = |text: String| BotReply {
-        chat_id: msg.chat.id,
-        reply_to: msg.message_id,
-        text,
-        markup: None,
-    };
-
     // Lock: the first private message after connect locks the bot to its sender
     // and is not run. Without `connected_at` nobody can claim the lock.
     let locked_user = match cfg.locked_user_id {
         Some(id) => id,
         None => {
             if cfg.connected_at.is_none() {
-                return Ok(None);
+                return Ok(Gate::Ignore);
             }
             let (id, newly) =
                 ctx.state
@@ -409,14 +404,31 @@ pub fn handle_update(ctx: &Ctx, u: &Update) -> Result<Option<BotReply>> {
                         }
                     })?;
             if newly {
-                return Ok(Some(say("\u{1f512} locked to you, send /help".to_string())));
+                return Ok(Gate::Say(say_to(msg, "\u{1f512} locked to you, send /list".to_string())));
             }
             id
         }
     };
     if from.id != locked_user {
-        return Ok(None);
+        return Ok(Gate::Ignore);
     }
+    Ok(Gate::Open(cfg))
+}
+
+/// Handles one text update. `None` means: say nothing. (Photos and files: `handle_file`.)
+pub fn handle_update(ctx: &Ctx, u: &Update) -> Result<Option<BotReply>> {
+    let Some(msg) = &u.message else {
+        return Ok(None);
+    };
+    let Some(text) = &msg.text else {
+        return Ok(None);
+    };
+    let cfg = match gate(ctx, msg)? {
+        Gate::Ignore => return Ok(None),
+        Gate::Say(r) => return Ok(Some(r)),
+        Gate::Open(cfg) => cfg,
+    };
+    let say = |text: String| say_to(msg, text);
 
     let trimmed = text.trim();
     let reply = if let Some(cmdline) = trimmed.strip_prefix('/') {
@@ -431,16 +443,45 @@ pub fn handle_update(ctx: &Ctx, u: &Update) -> Result<Option<BotReply>> {
                 return Ok(Some(r));
             }
             "use" => cmd_use(ctx, args)?,
-            "send" => cmd_send(ctx, msg, args)?,
-            "last" => cmd_last(ctx, args)?,
-            _ => HELP.to_string(),
+            _ => ONLY_HINT.to_string(),
         }
     } else if trimmed.is_empty() {
         return Ok(None);
     } else {
-        cmd_reply_or_plain(ctx, msg, &cfg, trimmed)?
+        cmd_reply_or_plain(ctx, msg, &cfg, trimmed, ICON_SENT)?
     };
     Ok(Some(say(reply)))
+}
+
+/// A photo, document, video or audio message: download it to the inbox, then route it
+/// like text (swipe-reply target first, else the default session). No session: the
+/// downloaded file is deleted again. `None` means: not a file message, or ignore.
+pub fn handle_file(ctx: &Ctx, api: &dyn TelegramApi, u: &Update) -> Result<Option<BotReply>> {
+    let Some(msg) = &u.message else {
+        return Ok(None);
+    };
+    let Some((file, is_photo)) = msg.attachment() else {
+        return Ok(None);
+    };
+    let cfg = match gate(ctx, msg)? {
+        Gate::Ignore => return Ok(None),
+        Gate::Say(r) => return Ok(Some(r)),
+        Gate::Open(cfg) => cfg,
+    };
+    let path = match inbox::fetch(ctx, api, file, is_photo) {
+        Ok(p) => p,
+        Err(inbox::FetchError::TooBig) => return Ok(Some(say_to(msg, inbox::TOO_BIG.to_string()))),
+        Err(inbox::FetchError::Failed(e)) => {
+            return Ok(Some(say_to(msg, format!("\u{26a0}\u{fe0f} could not download the file: {e}"))));
+        }
+    };
+    let caption = msg.caption.as_deref().map(str::trim).filter(|c| !c.is_empty()).unwrap_or("(no caption)");
+    let text = format!("{caption}\nAttachment: {}", path.display());
+    let reply = cmd_reply_or_plain(ctx, msg, &cfg, &text, ICON_FILE)?;
+    if !reply.starts_with(ICON_FILE) {
+        let _ = std::fs::remove_file(&path);
+    }
+    Ok(Some(say_to(msg, reply)))
 }
 
 /// Sends a reply through `split_message`, `reply_to` on the first chunk only.
@@ -461,12 +502,62 @@ pub fn send_reply(api: &dyn TelegramApi, r: &BotReply) -> Result<()> {
 pub fn send_callback_reply(api: &dyn TelegramApi, r: &CallbackReply) -> Result<()> {
     api.answer_callback(&r.callback_id, &r.toast)?;
     if let Some((chat, mid, text, markup)) = &r.edit {
-        let _ = api.edit_message(*chat, *mid, text, markup);
+        let _ = match markup {
+            Some(m) => api.edit_message(*chat, *mid, text, m),
+            None => api.edit_text(*chat, *mid, text),
+        };
     }
     Ok(())
 }
 
-fn warn(ctx: &Ctx, what: &str) {
+/// Text of the pinned bar for the default session `receiver`.
+pub fn pin_text(receiver: Option<&str>) -> String {
+    format!("\u{1f4cc} CURRENT SESSION: {}", receiver.map_or("none".to_string(), str::to_uppercase))
+}
+
+/// Makes the pinned "current session" message show the current default. The Telegram
+/// app's pinned bar does not follow edits, so a changed text means: unpin and delete the
+/// stored message, send a new one, pin it silently, and store its id and text. An unchanged
+/// text does nothing. Skips when not locked. Errors are for the caller to report; they
+/// must never undo the default change.
+pub fn sync_pin(ctx: &Ctx, api: &dyn TelegramApi) -> Result<()> {
+    let cfg: TelegramConfig = ctx.state.read_json(TELEGRAM_FILE)?;
+    let (Some(_), Some(chat)) = (cfg.locked_user_id, cfg.locked_chat_id) else {
+        return Ok(());
+    };
+    let text = pin_text(cfg.receiver.as_deref());
+    if cfg.pinned_message_id.is_some() && cfg.pinned_text.as_deref() == Some(text.as_str()) {
+        return Ok(());
+    }
+    if let Some(old) = cfg.pinned_message_id {
+        for (what, r) in [("unpin", api.unpin_message(chat, old)), ("delete", api.delete_message(chat, old))] {
+            if let Err(e) = r {
+                let m = format!("{e:#}").to_lowercase();
+                let benign = m.contains("not found") || m.contains("can't be deleted") || m.contains("message_id_invalid");
+                if !benign {
+                    warn(ctx, &format!("could not {what} the old pinned bar: {e:#}"));
+                }
+            }
+        }
+    }
+    let mid = api.send_message(chat, &text, None)?;
+    ctx.state
+        .update_json(TELEGRAM_FILE, TELEGRAM_MODE, |c: &mut TelegramConfig| {
+            c.pinned_message_id = Some(mid);
+            c.pinned_text = Some(text.clone());
+            Ok(())
+        })?;
+    api.pin_message(chat, mid)
+}
+
+/// `sync_pin`, with a failure reported on stderr only.
+pub fn sync_pin_warn(ctx: &Ctx, api: &dyn TelegramApi) {
+    if let Err(e) = sync_pin(ctx, api) {
+        warn(ctx, &format!("could not update the pinned session bar: {e:#}"));
+    }
+}
+
+pub(super) fn warn(ctx: &Ctx, what: &str) {
     eprintln!("[{}] colony telegram: {what}", wib_secs(ctx.clock.now()));
 }
 
@@ -542,7 +633,7 @@ pub fn run_once(ctx: &Ctx, api: &dyn TelegramApi, offset: &mut i64) -> Result<()
 /// `sync_offset` to reset. A `getUpdates` error leaves `offset` unchanged.
 /// Per-update handler or send failures are reported on stderr and the update is
 /// still consumed, so one bad message cannot be replayed forever (and a delivered
-/// `/send` is never re-run).
+/// message is never re-run).
 pub fn run_once_for(ctx: &Ctx, api: &dyn TelegramApi, bot: Option<i64>, offset: &mut i64) -> Result<()> {
     let updates = api.get_updates(*offset, POLL_TIMEOUT_SECS)?;
     for u in updates {
@@ -551,8 +642,9 @@ pub fn run_once_for(ctx: &Ctx, api: &dyn TelegramApi, bot: Option<i64>, offset: 
             warn(ctx, "token changed during poll, dropping fetched updates");
             return Ok(());
         }
+        let receiver_before = cfg.receiver.clone();
         *offset = (*offset).max(u.update_id + 1);
-        // Persist before handling: a crash mid-update must not re-run a `/send`.
+        // Persist before handling: a crash mid-update must not re-run a message.
         persist_offset(ctx, bot, *offset);
         if u.callback_query.is_some() {
             match handle_callback(ctx, &u) {
@@ -564,9 +656,12 @@ pub fn run_once_for(ctx: &Ctx, api: &dyn TelegramApi, bot: Option<i64>, offset: 
                 Ok(None) => {}
                 Err(e) => warn(ctx, &format!("update {} failed: {e:#}", u.update_id)),
             }
+            sync_pin_if_changed(ctx, api, &receiver_before);
             continue;
         }
-        match handle_update(ctx, &u) {
+        let is_file = u.message.as_ref().is_some_and(|m| m.text.is_none() && m.attachment().is_some());
+        let handled = if is_file { handle_file(ctx, api, &u) } else { handle_update(ctx, &u) };
+        match handled {
             Ok(Some(r)) => {
                 if let Err(e) = send_reply(api, &r) {
                     warn(ctx, &format!("could not answer update {}: {e:#}", u.update_id));
@@ -575,8 +670,17 @@ pub fn run_once_for(ctx: &Ctx, api: &dyn TelegramApi, bot: Option<i64>, offset: 
             Ok(None) => {}
             Err(e) => warn(ctx, &format!("update {} failed: {e:#}", u.update_id)),
         }
+        sync_pin_if_changed(ctx, api, &receiver_before);
     }
     Ok(())
+}
+
+/// Refreshes the pinned bar when the default is no longer `before`.
+fn sync_pin_if_changed(ctx: &Ctx, api: &dyn TelegramApi, before: &Option<String>) {
+    let now = ctx.state.read_json::<TelegramConfig>(TELEGRAM_FILE).ok().and_then(|c| c.receiver);
+    if &now != before {
+        sync_pin_warn(ctx, api);
+    }
 }
 
 /// Records (or clears) this process as the running bot in telegram.json. Clearing
@@ -609,6 +713,22 @@ pub fn run_loop(
     offset: &mut i64,
     sleep: &dyn Fn(Duration),
 ) {
+    run_loop_with(ctx, api_for, offset, sleep, &sched::ShellRunner);
+}
+
+/// `run_loop` with the command runner for scheduled command jobs. The scheduler lives
+/// only here: it ticks about every 30 s between polls, and the built-in inbox cleanup
+/// runs at start and hourly.
+pub fn run_loop_with(
+    ctx: &Ctx,
+    api_for: &dyn Fn(&str) -> Box<dyn TelegramApi>,
+    offset: &mut i64,
+    sleep: &dyn Fn(Duration),
+    runner: &dyn sched::CmdRunner,
+) {
+    let started = ctx.clock.now();
+    let mut last_tick: Option<DateTime<Utc>> = None;
+    let mut last_clean: Option<DateTime<Utc>> = None;
     let mut current_bot: Option<i64> = None;
     let mut registered = false;
     // Token the command menu was last registered for.
@@ -640,12 +760,29 @@ pub fn run_loop(
         let api = api_for(&token);
         if menu_for.as_deref() != Some(token.as_str()) {
             register_commands(ctx, api.as_ref());
+            if cfg.receiver.is_some() {
+                sync_pin_warn(ctx, api.as_ref());
+            }
             menu_for = Some(token.clone());
+        }
+        let now = ctx.clock.now();
+        if last_clean.is_none_or(|t| now - t >= chrono::Duration::hours(1)) {
+            last_clean = Some(now);
+            if let Err(e) = inbox::cleanup(ctx) {
+                warn(ctx, &format!("inbox cleanup failed: {e:#}"));
+            }
         }
         if let Err(e) = run_once_for(ctx, api.as_ref(), current_bot, offset) {
             // `e` comes from the API layer, which scrubs the token.
             warn(ctx, &format!("{e:#}"));
             sleep(RETRY_SLEEP);
+        }
+        let now = ctx.clock.now();
+        if last_tick.is_none_or(|t| now - t >= chrono::Duration::seconds(sched::TICK_SECS)) {
+            last_tick = Some(now);
+            if let Err(e) = sched::tick(ctx, api.as_ref(), runner, started) {
+                warn(ctx, &format!("scheduler: {e:#}"));
+            }
         }
     }
 }
@@ -677,6 +814,7 @@ mod tests {
                 date: 1_000_000,
                 text: Some(text.to_string()),
                 reply_to_message: None,
+                ..Default::default()
             }),
             callback_query: None,
         }
@@ -721,10 +859,10 @@ mod tests {
         let h = Harness::herdr();
         set_cfg(&h, |c| c.connected_at = Some(999_999));
         session(&h, "bo", "w1:p2");
-        let r = handle_update(&h.ctx(), &upd(9, 42, 4242, "private", "/send bo hi"))
+        let r = handle_update(&h.ctx(), &upd(9, 42, 4242, "private", "/list"))
             .unwrap()
             .unwrap();
-        assert_eq!(r.text, "\u{1f512} locked to you, send /help");
+        assert_eq!(r.text, "\u{1f512} locked to you, send /list");
         assert_eq!(r.chat_id, 4242);
         assert_eq!(r.reply_to, 9);
         let cfg: TelegramConfig = h.state.read_json(TELEGRAM_FILE).unwrap();
@@ -781,7 +919,7 @@ mod tests {
     }
 
     #[test]
-    fn list_send_last_include_discovered_sessions() {
+    fn list_and_plain_text_include_discovered_sessions() {
         let h = Harness::herdr();
         locked(&h);
         h.backends.herdr.add_claude("w1:p6", AgentState::Idle, Some("\"solo\""));
@@ -790,21 +928,22 @@ mod tests {
         assert!(t.contains("solo - claude* - idle (herdr w1:p6)"), "{t}");
         assert!(t.contains("w1:p7 - claude* - idle (herdr w1:p7)"), "{t}");
         assert!(t.ends_with("* not registered"), "{t}");
-        assert_eq!(answer(&h, &priv_msg("/send solo hi")), "\u{1f4e8} sent to solo");
+        set_cfg(&h, |c| c.receiver = Some("solo".to_string()));
+        assert_eq!(answer(&h, &priv_msg("hi")), "\u{1f4e8} sent to solo");
         assert!(h.backends.herdr.sends()[0].starts_with("send w1:p6 "));
-        assert_eq!(answer(&h, &priv_msg("/send w1:p7 yo")), "\u{1f4e8} sent to w1:p7");
+        set_cfg(&h, |c| c.receiver = Some("w1:p7".to_string()));
+        assert_eq!(answer(&h, &priv_msg("yo")), "\u{1f4e8} sent to w1:p7");
         assert!(h.backends.herdr.sends()[1].starts_with("send w1:p7 "));
-        *h.backends.herdr.read_text.borrow_mut() = "tail".into();
-        assert_eq!(answer(&h, &priv_msg("/last solo 5")), "tail");
         assert!(h.names().0.is_empty());
     }
 
     #[test]
-    fn send_creates_pending_and_delivers_telegram_envelope() {
+    fn plain_text_creates_pending_and_delivers_telegram_envelope() {
         let h = Harness::herdr();
         locked(&h);
         session(&h, "bo-server", "w1:p2");
-        let t = answer(&h, &priv_msg("/send bo-server status?"));
+        set_cfg(&h, |c| c.receiver = Some("bo-server".to_string()));
+        let t = answer(&h, &priv_msg("status?"));
         assert_eq!(t, "\u{1f4e8} sent to bo-server");
         let p = pending(&h);
         assert_eq!(p.0.len(), 1);
@@ -820,64 +959,28 @@ mod tests {
     }
 
     #[test]
-    fn send_works_without_receiver() {
-        let h = Harness::herdr();
-        locked(&h);
-        session(&h, "bo", "w1:p2");
-        assert_eq!(answer(&h, &priv_msg("/send bo hello there")), "\u{1f4e8} sent to bo");
-        assert!(h.backends.herdr.sends()[0].contains("Message: hello there"));
-    }
-
-    #[test]
-    fn send_unknown_target_replies_error_no_pending() {
-        let h = Harness::herdr();
-        locked(&h);
-        let t = answer(&h, &priv_msg("/send ghost hi"));
-        assert_eq!(t, "\u{26a0}\u{fe0f} no session named ghost");
-        assert!(pending(&h).0.is_empty());
-        assert!(h.backends.herdr.sends().is_empty());
-        // A registered name whose pane is gone is also an error without pending.
-        h.add_name("dead", BackendKind::Herdr, "w1:p77", Kind::Claude);
-        assert_eq!(answer(&h, &priv_msg("/send dead hi")), "\u{26a0}\u{fe0f} no session named dead");
-        assert!(pending(&h).0.is_empty());
-    }
-
-    #[test]
     fn failed_delivery_removes_pending() {
         let h = Harness::herdr();
         locked(&h);
         session(&h, "bo", "w1:p2");
+        set_cfg(&h, |c| c.receiver = Some("bo".to_string()));
         h.backends.herdr.fail_send.set(true);
-        let t = answer(&h, &priv_msg("/send bo hi"));
+        let t = answer(&h, &priv_msg("hi"));
         assert!(t.starts_with("\u{26a0}\u{fe0f} could not send to bo"), "{t}");
         assert!(pending(&h).0.is_empty());
     }
 
     #[test]
-    fn last_trimmed_to_limit() {
+    fn removed_commands_answer_with_the_hint() {
         let h = Harness::herdr();
         locked(&h);
         session(&h, "bo", "w1:p2");
-        let text = (0..100)
-            .map(|i| format!("{i:03}{}", "y".repeat(197)))
-            .collect::<Vec<_>>()
-            .join("\n");
-        *h.backends.herdr.read_text.borrow_mut() = text;
-        let t = answer(&h, &priv_msg("/last bo 100"));
-        assert!(t.encode_utf16().count() <= TG_LIMIT);
-        assert!(t.contains("099yyy"));
-        assert!(!t.contains("000yyy"));
-        assert!(h.backends.herdr.log.borrow().contains(&"read w1:p2 100".to_string()));
-    }
-
-    #[test]
-    fn help_lists_commands() {
-        let h = Harness::herdr();
-        locked(&h);
-        let t = answer(&h, &priv_msg("/help"));
-        for want in ["/list", "/use <name>", "/send <name> <msg>", "/last <name> [lines]", "/help", "Plain text"] {
-            assert!(t.contains(want), "missing {want}: {t}");
+        for cmd in ["/send bo hi", "/last bo 5", "/help", "/schedule", "/schedule add x 0 9 * * * bo hi", "/start", "/foo bar", "/Settings", "/"] {
+            assert_eq!(answer(&h, &priv_msg(cmd)), ONLY_HINT, "{cmd}");
         }
+        assert_eq!(ONLY_HINT, "\u{2139}\u{fe0f} only /list and /use \u{2014} type normally to talk to your session");
+        assert!(h.backends.herdr.sends().is_empty());
+        assert!(pending(&h).0.is_empty());
     }
 
     #[test]
@@ -906,7 +1009,7 @@ mod tests {
         let h = Harness::herdr();
         locked(&h);
         set_cfg(&h, |c| c.receiver = Some("gone".to_string()));
-        assert_eq!(answer(&h, &priv_msg("hi")), "\u{26a0}\u{fe0f} receiver gone not found, use /send");
+        assert_eq!(answer(&h, &priv_msg("hi")), "\u{26a0}\u{fe0f} receiver gone not found, use /use");
         assert!(pending(&h).0.is_empty());
     }
 
@@ -916,19 +1019,8 @@ mod tests {
         locked(&h);
         assert_eq!(
             answer(&h, &priv_msg("hi")),
-            "\u{2753} no session selected, use /use <name> or /send <name> <msg>"
+            "\u{2753} no session selected, use /use <name>"
         );
-    }
-
-    #[test]
-    fn recognises_only_known_commands() {
-        let h = Harness::herdr();
-        locked(&h);
-        let help = answer(&h, &priv_msg("/help"));
-        for other in ["/start", "/foo bar", "/Settings", "/"] {
-            assert_eq!(answer(&h, &priv_msg(other)), help, "{other}");
-        }
-        assert!(h.backends.herdr.sends().is_empty());
     }
 
     #[test]
@@ -936,7 +1028,7 @@ mod tests {
         let h = Harness::herdr();
         locked(&h);
         let api = FakeTelegram::new();
-        api.updates.borrow_mut().push_back(vec![priv_msg("/help")]);
+        api.updates.borrow_mut().push_back(vec![priv_msg("/list")]);
         let mut offset = 0;
         run_once(&h.ctx(), &api, &mut offset).unwrap();
         assert_eq!(offset, 6);
@@ -1062,7 +1154,7 @@ mod tests {
         let h = Harness::herdr();
         session(&h, "bo", "w1:p2");
         set_cfg(&h, |c| c.connected_at = Some(2_000_000));
-        let mut stale = upd(1, 66, 66, "private", "/send bo rm -rf");
+        let mut stale = upd(1, 66, 66, "private", "rm -rf");
         stale.message.as_mut().unwrap().date = 1_999_999;
         assert_eq!(handle_update(&h.ctx(), &stale).unwrap(), None);
         let cfg: TelegramConfig = h.state.read_json(TELEGRAM_FILE).unwrap();
@@ -1072,11 +1164,11 @@ mod tests {
         // A message after the connect second claims the lock.
         let mut fresh = upd(2, 77, 77, "private", "hi");
         fresh.message.as_mut().unwrap().date = 2_000_001;
-        assert_eq!(answer(&h, &fresh), "\u{1f512} locked to you, send /help");
+        assert_eq!(answer(&h, &fresh), "\u{1f512} locked to you, send /list");
         let cfg: TelegramConfig = h.state.read_json(TELEGRAM_FILE).unwrap();
         assert_eq!(cfg.locked_user_id, Some(77));
         // After the lock, a stale message from the locked user is still not run.
-        let mut old = upd(3, 77, 77, "private", "/send bo x");
+        let mut old = upd(3, 77, 77, "private", "x");
         old.message.as_mut().unwrap().date = 5;
         assert_eq!(handle_update(&h.ctx(), &old).unwrap(), None);
         assert!(h.backends.herdr.sends().is_empty());
@@ -1095,9 +1187,12 @@ mod tests {
         let h = Harness::herdr();
         locked(&h);
         session(&h, "bo", "w1:p2");
-        set_cfg(&h, |c| c.offset_bot_id = Some(111));
+        set_cfg(&h, |c| {
+            c.offset_bot_id = Some(111);
+            c.receiver = Some("bo".to_string());
+        });
         let api = FakeTelegram::new();
-        api.updates.borrow_mut().push_back(vec![priv_msg("/send bo once")]);
+        api.updates.borrow_mut().push_back(vec![priv_msg("once")]);
         let mut offset = 0;
         run_once(&h.ctx(), &api, &mut offset).unwrap();
         assert_eq!(h.backends.herdr.sends().len(), 1);
@@ -1187,7 +1282,7 @@ mod tests {
         let fake = FakeTelegram::new();
         let mut stranger = upd(900, 66, 66, "private", "hello");
         stranger.message.as_mut().unwrap().date = 2_000_000;
-        let mut owner = upd(901, 42, 42, "private", "/send bo x");
+        let mut owner = upd(901, 42, 42, "private", "x");
         owner.message.as_mut().unwrap().date = 2_000_000;
         fake.updates.borrow_mut().push_back(vec![stranger, owner]);
         let api = ReconnectingApi(&h, fake);
@@ -1245,7 +1340,7 @@ mod tests {
         assert_eq!(cfg.locked_user_id, None);
         // Same for an already locked bot: not executed.
         set_cfg(&h, |c| c.locked_user_id = Some(66));
-        let mut cmd = upd(2, 66, 66, "private", "/send bo x");
+        let mut cmd = upd(2, 66, 66, "private", "x");
         cmd.message.as_mut().unwrap().date = 2_000_000;
         assert_eq!(handle_update(&h.ctx(), &cmd).unwrap(), None);
         assert!(h.backends.herdr.sends().is_empty());
@@ -1298,6 +1393,7 @@ mod tests {
                     date: 1_000_000,
                     text: Some(USE_PROMPT.to_string()),
                     reply_to_message: None,
+                    ..Default::default()
                 }),
                 data: Some(data.to_string()),
             }),
@@ -1314,11 +1410,10 @@ mod tests {
         let r = handle_update(&h.ctx(), &priv_msg("/use")).unwrap().unwrap();
         assert_eq!(r.text, "\u{1f3af} Choose default session:");
         let b = buttons(r.markup.as_ref().unwrap());
-        assert_eq!(b.len(), 4, "{b:?}");
+        assert_eq!(b.len(), 3, "{b:?}");
         assert_eq!(b[0], ("\u{1f7e2} bo".to_string(), "use:w1:p2".to_string()));
         assert_eq!(b[1], ("\u{1f7e1} ca".to_string(), "use:w1:p3".to_string()));
         assert_eq!(b[2], ("\u{1f534} solo".to_string(), "use:w1:p6".to_string()));
-        assert_eq!(b[3], ("\u{1f6ab} off".to_string(), "use:off".to_string()));
         assert!(b.iter().all(|(_, d)| d.len() <= 64));
         // The default carries the check.
         answer(&h, &priv_msg("/use ca"));
@@ -1344,18 +1439,16 @@ mod tests {
         send_callback_reply(&api, &r).unwrap();
         assert_eq!(receiver_of(&h).as_deref(), Some("ca"));
         assert_eq!(api.answers.borrow().as_slice(), &[("cb1".to_string(), "\u{1f3af} ca".to_string())]);
-        let edits = api.edits.borrow();
-        assert_eq!((edits[0].0, edits[0].1), (42, 77));
-        let b = buttons(&edits[0].3);
-        assert_eq!(b[1].0, "\u{2705} \u{1f7e2} ca");
-        assert_eq!(b[0].0, "\u{1f7e2} bo");
-        drop(edits);
+        // The keyboard is gone: plain text edit, no markup.
+        assert!(api.edits.borrow().is_empty());
+        assert_eq!(api.text_edits.borrow().as_slice(), &[(42, 77, "\u{1f3af} Default session: ca".to_string())]);
         // off clears it and the check goes away.
         let r = handle_callback(&h.ctx(), &tap(2, 42, "private", "use:off")).unwrap().unwrap();
         assert_eq!(receiver_of(&h), None);
         assert_eq!(r.toast, "\u{1f3af} default cleared");
-        let b = buttons(&r.edit.unwrap().3);
-        assert!(b.iter().all(|(t, _)| !t.contains('\u{2705}')), "{b:?}");
+        let e = r.edit.unwrap();
+        assert_eq!(e.2, "\u{1f3af} Default session cleared");
+        assert!(e.3.is_none());
     }
 
     #[test]
@@ -1387,8 +1480,8 @@ mod tests {
         let r = handle_callback(&h.ctx(), &tap(1, 42, "private", "use:w1:p9")).unwrap().unwrap();
         assert_eq!(r.toast, "\u{26a0}\u{fe0f} session gone");
         assert_eq!(receiver_of(&h), None);
-        let b = buttons(&r.edit.unwrap().3);
-        assert_eq!(b.len(), 2);
+        let b = buttons(&r.edit.unwrap().3.unwrap());
+        assert_eq!(b.len(), 1);
         assert_eq!(b[0].1, "use:w1:p2");
     }
 
@@ -1543,7 +1636,7 @@ mod tests {
         answer(&h, &priv_msg("/use off"));
         assert_eq!(
             answer(&h, &priv_msg("hi")),
-            "\u{2753} no session selected, use /use <name> or /send <name> <msg>"
+            "\u{2753} no session selected, use /use <name>"
         );
         assert_eq!(h.backends.herdr.sends().len(), 2);
     }
@@ -1559,11 +1652,10 @@ mod tests {
         working(&h, "w1:p2", AgentState::Working);
         h.add_name("bo", BackendKind::Herdr, "w1:p2", Kind::Claude);
         let want = "\u{1f4e8} sent to bo (\u{23f3} busy \u{2014} it will answer after its current task)";
-        assert_eq!(answer(&h, &priv_msg("/send bo hi")), want);
         answer(&h, &priv_msg("/use bo"));
         assert_eq!(answer(&h, &priv_msg("plain")), want);
-        assert_eq!(h.backends.herdr.sends().len(), 2);
-        assert_eq!(pending(&h).0.len(), 2);
+        assert_eq!(h.backends.herdr.sends().len(), 1);
+        assert_eq!(pending(&h).0.len(), 1);
     }
 
     #[test]
@@ -1572,10 +1664,12 @@ mod tests {
         locked(&h);
         working(&h, "w1:p2", AgentState::Idle);
         h.add_name("bo", BackendKind::Herdr, "w1:p2", Kind::Claude);
-        assert_eq!(answer(&h, &priv_msg("/send bo hi")), "\u{1f4e8} sent to bo");
+        answer(&h, &priv_msg("/use bo"));
+        assert_eq!(answer(&h, &priv_msg("hi")), "\u{1f4e8} sent to bo");
         h.backends.tmux.add_pane("%5", None);
         h.add_name("tw", BackendKind::Tmux, "%5", Kind::Claude);
-        assert_eq!(answer(&h, &priv_msg("/send tw hi")), "\u{1f4e8} sent to tw");
+        answer(&h, &priv_msg("/use tw"));
+        assert_eq!(answer(&h, &priv_msg("hi")), "\u{1f4e8} sent to tw");
     }
 
     #[test]
@@ -1584,10 +1678,6 @@ mod tests {
         locked(&h);
         working(&h, "w1:p2", AgentState::Blocked);
         h.add_name("bo", BackendKind::Herdr, "w1:p2", Kind::Claude);
-        assert_eq!(
-            answer(&h, &priv_msg("/send bo hi")),
-            "\u{26d4} not delivered: bo is waiting on a prompt"
-        );
         answer(&h, &priv_msg("/use bo"));
         assert_eq!(
             answer(&h, &priv_msg("plain")),
@@ -1646,9 +1736,352 @@ mod tests {
                 let calls = fake.commands.borrow();
                 assert_eq!(calls.len(), 1);
                 let names: Vec<&str> = calls[0].iter().map(|(c, _)| c.as_str()).collect();
-                assert_eq!(names, vec!["list", "use", "send", "last", "help"]);
+                assert_eq!(names, vec!["list", "use"]);
                 assert!(calls[0][1].1.starts_with("Set default session"));
             }
         }
+    }
+
+    fn pinned_id(h: &Harness) -> Option<i64> {
+        h.state.read_json::<TelegramConfig>(TELEGRAM_FILE).unwrap().pinned_message_id
+    }
+
+    fn run_updates(h: &Harness, api: &FakeTelegram, ups: Vec<Update>) {
+        api.updates.borrow_mut().push_back(ups);
+        let mut off = 0;
+        run_once(&h.ctx(), api, &mut off).unwrap();
+    }
+
+    const BAR_BO: &str = "\u{1f4cc} CURRENT SESSION: BO";
+
+    #[test]
+    fn tap_removes_keyboard() {
+        let h = Harness::herdr();
+        locked(&h);
+        live(&h, "bo", "w1:p2", AgentState::Idle);
+        let api = FakeTelegram::new();
+        run_updates(&h, &api, vec![tap(1, 42, "private", "use:w1:p2")]);
+        assert!(api.edits.borrow().is_empty());
+        assert_eq!(api.answers.borrow().len(), 1);
+        assert_eq!(api.text_edits.borrow()[0].2, "\u{1f3af} Default session: bo");
+    }
+
+    #[test]
+    fn change_unpins_deletes_old_then_sends_and_pins_new() {
+        let h = Harness::herdr();
+        locked(&h);
+        live(&h, "bo", "w1:p2", AgentState::Idle);
+        live(&h, "ca", "w1:p3", AgentState::Idle);
+        let api = FakeTelegram::new();
+        run_updates(&h, &api, vec![upd(1, 42, 42, "private", "/use bo")]);
+        let first = pinned_id(&h).unwrap();
+        assert!(api.ids.borrow().iter().any(|(id, c, t)| *id == first && *c == 42 && t == BAR_BO));
+        assert_eq!(api.pins.borrow().as_slice(), &[(42, first)]);
+        assert!(api.unpins.borrow().is_empty() && api.deletes.borrow().is_empty());
+        run_updates(&h, &api, vec![upd(2, 42, 42, "private", "/use ca")]);
+        let second = pinned_id(&h).unwrap();
+        assert_ne!(second, first);
+        assert_eq!(api.unpins.borrow().as_slice(), &[(42, first)]);
+        assert_eq!(api.deletes.borrow().as_slice(), &[(42, first)]);
+        assert_eq!(api.pins.borrow().as_slice(), &[(42, first), (42, second)]);
+        assert!(api.ids.borrow().iter().any(|(id, _, t)| *id == second && t == "\u{1f4cc} CURRENT SESSION: CA"));
+        let cfg: TelegramConfig = h.state.read_json(TELEGRAM_FILE).unwrap();
+        assert_eq!(cfg.pinned_text.as_deref(), Some("\u{1f4cc} CURRENT SESSION: CA"));
+        run_updates(&h, &api, vec![upd(3, 42, 42, "private", "/use off")]);
+        let third = pinned_id(&h).unwrap();
+        assert_eq!(api.deletes.borrow().last(), Some(&(42, second)));
+        assert!(api.ids.borrow().iter().any(|(id, _, t)| *id == third && t == "\u{1f4cc} CURRENT SESSION: none"));
+    }
+
+    #[test]
+    fn delete_failure_is_tolerated() {
+        let h = Harness::herdr();
+        locked(&h);
+        live(&h, "bo", "w1:p2", AgentState::Idle);
+        let api = FakeTelegram::new();
+        run_updates(&h, &api, vec![upd(1, 42, 42, "private", "/use bo")]);
+        let old = pinned_id(&h).unwrap();
+        api.fail_delete.set(true);
+        run_updates(&h, &api, vec![upd(2, 42, 42, "private", "/use off")]);
+        let new = pinned_id(&h).unwrap();
+        assert_ne!(new, old);
+        assert_eq!(api.pins.borrow().as_slice(), &[(42, old), (42, new)]);
+        assert_eq!(receiver_of(&h), None);
+    }
+
+    #[test]
+    fn unchanged_text_makes_no_calls() {
+        let h = Harness::herdr();
+        locked(&h);
+        live(&h, "bo", "w1:p2", AgentState::Idle);
+        let api = FakeTelegram::new();
+        set_cfg(&h, |c| c.receiver = Some("bo".to_string()));
+        sync_pin(&h.ctx(), &api).unwrap();
+        let id = pinned_id(&h).unwrap();
+        let sent = api.sent.borrow().len();
+        sync_pin(&h.ctx(), &api).unwrap();
+        assert_eq!(pinned_id(&h), Some(id));
+        assert_eq!(api.sent.borrow().len(), sent);
+        assert_eq!(api.pins.borrow().len(), 1);
+        assert!(api.unpins.borrow().is_empty() && api.deletes.borrow().is_empty());
+        assert!(api.text_edits.borrow().is_empty());
+    }
+
+    #[test]
+    fn pin_failure_does_not_block_the_change() {
+        let h = Harness::herdr();
+        locked(&h);
+        live(&h, "bo", "w1:p2", AgentState::Idle);
+        let api = FakeTelegram::new();
+        api.fail_pin.set(true);
+        run_updates(&h, &api, vec![upd(1, 42, 42, "private", "/use bo")]);
+        assert_eq!(receiver_of(&h).as_deref(), Some("bo"));
+        assert!(api.sent.borrow().iter().any(|s| s.1.contains("default session: bo")));
+        assert!(api.pins.borrow().is_empty());
+    }
+
+    #[test]
+    fn loop_start_refreshes_bar_when_default_set() {
+        use std::rc::Rc;
+        struct Shared(Rc<FakeTelegram>);
+        impl TelegramApi for Shared {
+            fn get_me(&self) -> Result<super::super::api::BotInfo> {
+                self.0.get_me()
+            }
+            fn get_updates(&self, o: i64, t: u64) -> Result<Vec<Update>> {
+                self.0.get_updates(o, t)
+            }
+            fn send_message(&self, c: i64, t: &str, r: Option<i64>) -> Result<i64> {
+                self.0.send_message(c, t, r)
+            }
+            fn pin_message(&self, c: i64, m: i64) -> Result<()> {
+                self.0.pin_message(c, m)
+            }
+            fn unpin_message(&self, c: i64, m: i64) -> Result<()> {
+                self.0.unpin_message(c, m)
+            }
+            fn delete_message(&self, c: i64, m: i64) -> Result<()> {
+                self.0.delete_message(c, m)
+            }
+            fn set_my_commands(&self, c: &[(&str, &str)]) -> Result<()> {
+                self.0.set_my_commands(c)
+            }
+        }
+        let h = Harness::herdr();
+        locked(&h);
+        set_cfg(&h, |c| c.receiver = Some("bo".to_string()));
+        let fake = Rc::new(FakeTelegram::new());
+        let state = &h.state;
+        let polls = std::cell::Cell::new(0);
+        let f = |_t: &str| -> Box<dyn TelegramApi> {
+            polls.set(polls.get() + 1);
+            if polls.get() == 2 {
+                state
+                    .update_json(TELEGRAM_FILE, TELEGRAM_MODE, |c: &mut TelegramConfig| {
+                        c.token = None;
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            Box::new(Shared(fake.clone()))
+        };
+        let mut offset = 0;
+        run_loop(&h.ctx(), &f, &mut offset, &|_| {});
+        assert_eq!(fake.pins.borrow().len(), 1);
+        assert!(fake.ids.borrow().iter().any(|(_, _, t)| t == BAR_BO));
+    }
+    // ---- photos and files from the phone ----
+
+    use crate::telegram::api::FileRef;
+
+    fn file_msg(id: i64, f: impl FnOnce(&mut Message)) -> Update {
+        let mut u = upd(id, 42, 42, "private", "");
+        let m = u.message.as_mut().unwrap();
+        m.text = None;
+        f(m);
+        u
+    }
+
+    fn fref(id: &str) -> FileRef {
+        FileRef { file_id: id.to_string(), ..Default::default() }
+    }
+
+    fn inbox_files(h: &Harness) -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(h.state.path("inbox"))
+            .map(|d| d.map(|e| e.unwrap().path()).collect())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn photo_is_downloaded_and_sent_with_attachment_line() {
+        let h = Harness::herdr();
+        locked(&h);
+        session(&h, "bo", "w1:p2");
+        set_cfg(&h, |c| c.receiver = Some("bo".to_string()));
+        let api = FakeTelegram::new();
+        api.add_download("big", "photos/file_2.jpg", b"BIGJPEG");
+        let u = file_msg(8, |m| {
+            m.photo = vec![
+                FileRef { file_id: "small".into(), file_size: Some(10), ..Default::default() },
+                FileRef { file_id: "big".into(), file_size: Some(7), ..Default::default() },
+            ];
+            m.photo[0].file_size = Some(3);
+            m.caption = Some("what is this?".to_string());
+        });
+        let r = handle_file(&h.ctx(), &api, &u).unwrap().unwrap();
+        assert_eq!(r.text, "\u{1f4ce} sent to bo");
+        let files = inbox_files(&h);
+        assert_eq!(files.len(), 1);
+        assert_eq!(std::fs::read(&files[0]).unwrap(), b"BIGJPEG");
+        // the largest size was requested
+        assert_eq!(*api.file_requests.borrow(), vec!["small".to_string()].into_iter().filter(|_| false).chain(["big".to_string()]).collect::<Vec<_>>());
+        let sends = h.backends.herdr.sends();
+        assert_eq!(sends.len(), 1);
+        assert!(sends[0].contains("From: telegram (reply-id "), "{sends:?}");
+        assert!(
+            sends[0].contains(&format!("Message: what is this?\nAttachment: {}\n", files[0].display())),
+            "{sends:?}"
+        );
+        assert_eq!(pending(&h).0.len(), 1);
+    }
+
+    #[test]
+    fn document_without_caption_and_busy_rule() {
+        let h = Harness::herdr();
+        locked(&h);
+        live(&h, "bo", "w1:p2", AgentState::Working);
+        set_cfg(&h, |c| c.receiver = Some("bo".to_string()));
+        let api = FakeTelegram::new();
+        api.add_download("d1", "documents/file_5.pdf", b"%PDF");
+        let u = file_msg(9, |m| m.document = Some(fref("d1")));
+        let r = handle_file(&h.ctx(), &api, &u).unwrap().unwrap();
+        assert!(r.text.starts_with("\u{1f4ce} sent to bo (\u{23f3} busy"), "{}", r.text);
+        let files = inbox_files(&h);
+        assert!(files[0].to_str().unwrap().ends_with(".pdf"));
+        assert!(h.backends.herdr.sends()[0].contains("Message: (no caption)\nAttachment: "));
+    }
+
+    #[test]
+    fn file_follows_swipe_reply_target() {
+        let h = Harness::herdr();
+        locked(&h);
+        session(&h, "bo", "w1:p2");
+        session(&h, "ca", "w1:p3");
+        set_cfg(&h, |c| c.receiver = Some("bo".to_string()));
+        h.state
+            .update_json(SENT_FILE, 0o600, |s: &mut Sent| {
+                s.record(h.clock.0, 42, &[500], "ca");
+                Ok(())
+            })
+            .unwrap();
+        let api = FakeTelegram::new();
+        api.add_download("d1", "documents/file_5.txt", b"x");
+        let u = file_msg(9, |m| {
+            m.document = Some(fref("d1"));
+            m.reply_to_message = Some(crate::telegram::api::ReplyRef { message_id: 500 });
+        });
+        handle_file(&h.ctx(), &api, &u).unwrap().unwrap();
+        assert_eq!(h.backends.herdr.sends().len(), 1);
+        assert!(h.backends.herdr.sends()[0].starts_with("send w1:p3 "));
+    }
+
+    #[test]
+    fn file_without_session_is_deleted_again() {
+        let h = Harness::herdr();
+        locked(&h);
+        let api = FakeTelegram::new();
+        api.add_download("d1", "documents/file_5.txt", b"x");
+        let u = file_msg(9, |m| m.document = Some(fref("d1")));
+        let r = handle_file(&h.ctx(), &api, &u).unwrap().unwrap();
+        assert!(r.text.starts_with("\u{2753} no session selected"), "{}", r.text);
+        assert!(inbox_files(&h).is_empty());
+        assert!(pending(&h).0.is_empty());
+    }
+
+    #[test]
+    fn too_big_file_is_refused_without_download() {
+        let h = Harness::herdr();
+        locked(&h);
+        session(&h, "bo", "w1:p2");
+        set_cfg(&h, |c| c.receiver = Some("bo".to_string()));
+        let api = FakeTelegram::new();
+        let u = file_msg(9, |m| {
+            m.document = Some(FileRef { file_id: "x".into(), file_size: Some(25 * 1024 * 1024), ..Default::default() })
+        });
+        let r = handle_file(&h.ctx(), &api, &u).unwrap().unwrap();
+        assert_eq!(r.text, "\u{26a0}\u{fe0f} file too big (max 20 MB)");
+        assert!(api.file_requests.borrow().is_empty());
+        assert!(inbox_files(&h).is_empty() && h.backends.herdr.sends().is_empty());
+    }
+
+    #[test]
+    fn file_from_stranger_or_group_is_ignored_and_not_downloaded() {
+        let h = Harness::herdr();
+        locked(&h);
+        let api = FakeTelegram::new();
+        api.add_download("d1", "documents/file_5.txt", b"x");
+        let mut u = file_msg(9, |m| m.document = Some(fref("d1")));
+        u.message.as_mut().unwrap().from = Some(User { id: 7 });
+        assert!(handle_file(&h.ctx(), &api, &u).unwrap().is_none());
+        let mut u = file_msg(9, |m| m.document = Some(fref("d1")));
+        u.message.as_mut().unwrap().chat.kind = "group".to_string();
+        assert!(handle_file(&h.ctx(), &api, &u).unwrap().is_none());
+        assert!(api.file_requests.borrow().is_empty());
+    }
+
+    #[test]
+    fn run_once_routes_file_messages() {
+        let h = Harness::herdr();
+        locked(&h);
+        session(&h, "bo", "w1:p2");
+        set_cfg(&h, |c| c.receiver = Some("bo".to_string()));
+        let api = FakeTelegram::new();
+        api.add_download("d1", "documents/file_5.txt", b"x");
+        api.updates.borrow_mut().push_back(vec![file_msg(9, |m| m.document = Some(fref("d1")))]);
+        let mut offset = 0;
+        run_once(&h.ctx(), &api, &mut offset).unwrap();
+        assert_eq!(api.sent.borrow()[0].1, "\u{1f4ce} sent to bo");
+    }
+
+    #[test]
+    fn loop_cleans_inbox_at_start_and_does_not_replay_missed_jobs() {
+        let h = Harness::herdr();
+        locked(&h);
+        session(&h, "bo", "w1:p2");
+        let dir = h.state.path("inbox");
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.jpg");
+        std::fs::write(&old, b"x").unwrap();
+        let t: std::time::SystemTime = (h.clock.0 - chrono::Duration::days(9)).into();
+        std::fs::File::options().write(true).open(&old).unwrap().set_modified(t).unwrap();
+        crate::state::schedule::add_job(
+            &h.state,
+            "m",
+            "* * * * *",
+            "UTC",
+            crate::state::schedule::JobKind::Message { target: "bo".into(), message: "x".into() },
+        )
+        .unwrap();
+        let fake = FakeTelegram::new();
+        let polls = std::cell::Cell::new(0);
+        let f = |_: &str| -> Box<dyn TelegramApi> {
+            polls.set(polls.get() + 1);
+            if polls.get() >= 2 {
+                set_cfg(&h, |c| c.token = None);
+            }
+            Box::new(FakeTelegram::new())
+        };
+        let _ = &fake;
+        let mut offset = 0;
+        run_loop(&h.ctx(), &f, &mut offset, &|_| {});
+        assert!(!old.exists());
+        // the loop started after that minute began: nothing was fired
+        assert!(h.backends.herdr.sends().is_empty());
+    }
+
+    #[test]
+    fn menu_has_only_list_and_use() {
+        let names: Vec<&str> = BOT_COMMANDS.iter().map(|(c, _)| *c).collect();
+        assert_eq!(names, vec!["list", "use"]);
     }
 }

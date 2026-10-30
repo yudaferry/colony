@@ -16,6 +16,11 @@ pub fn wib_secs(dt: DateTime<Utc>) -> String {
     )
 }
 
+/// `2026-10-29_215203` (WIB), for file names.
+pub fn file_stamp(dt: DateTime<Utc>) -> String {
+    dt.with_timezone(&Jakarta).format("%Y-%m-%d_%H%M%S").to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
